@@ -1,0 +1,33 @@
+[package]
+name = "luminux"
+version = "0.28.2"
+edition = "2024"
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+dirs = "7.0.0"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "accesskit"] }
+epaint_default_fonts = "0.37"
+flate2 = "1"
+half = { version = "2.7.1", features = ["bytemuck"] }
+image = "0.25"
+kamadak-exif = "0.6.1"
+moxcms = "0.9.1"
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-22", "webgpu"] }
+pollster = "1.0.1"
+rawler = "0.8"
+rayon = "1.12"
+rfd = "0.17.2"
+roxmltree = "0.21.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = "3"
+walkdir = "2.5.0"
+webp = { version = "0.3", default-features = false }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+
+[profile.release]
+strip = true

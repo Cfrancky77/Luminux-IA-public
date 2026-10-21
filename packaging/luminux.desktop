@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Luminux IA
+Comment=Retouche photo non destructive (RAW, GPU)
+Exec=luminux %F
+Icon=luminux
+Categories=Graphics;Photography;
+MimeType=image/jpeg;image/png;image/tiff;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-sony-arw;image/x-adobe-dng;
+Terminal=false
