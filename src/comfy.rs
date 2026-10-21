@@ -524,6 +524,83 @@ pub fn expand(img: &image::RgbImage, margins: [u32; 4], req: &Request) -> Result
     Ok((out, translated))
 }
 
+/// Raccord des teintes : le modèle rend souvent la zone plus claire ou plus terne que la photo (carré
+/// visible, essai réel du 2026-10-21 en local). L'écart photo − résultat, mesuré autour de la zone, est
+/// prolongé en douceur à l'intérieur (équation de Laplace sur une grille réduite) puis ajouté au résultat.
+fn match_context(out: &mut image::RgbImage, orig: &image::RgbaImage, hole: &[f32]) {
+    let (w, h) = out.dimensions();
+    let g = 96.0 / w.max(h) as f32;
+    let (gw, gh) = (((w as f32 * g).ceil() as usize).max(2), ((h as f32 * g).ceil() as usize).max(2));
+    let mut sum = vec![[0.0f32; 3]; gw * gh];
+    let mut n = vec![0u32; gw * gh];
+    for y in 0..h {
+        for x in 0..w {
+            if hole[(y * w + x) as usize] > 0.5 {
+                continue;
+            }
+            let c = ((y as f32 * g) as usize).min(gh - 1) * gw + ((x as f32 * g) as usize).min(gw - 1);
+            let (a, b) = (orig.get_pixel(x, y), out.get_pixel(x, y));
+            for k in 0..3 {
+                sum[c][k] += a[k] as f32 - b[k] as f32;
+            }
+            n[c] += 1;
+        }
+    }
+    let known: Vec<bool> = n.iter().map(|&k| k > 0).collect();
+    if !known.iter().any(|&k| k) {
+        return;
+    }
+    let mut f: Vec<[f32; 3]> = sum.iter().zip(&n).map(|(s, &k)| if k > 0 { s.map(|v| v / k as f32) } else { [0.0; 3] }).collect();
+    let mean = {
+        let (mut m, mut k) = ([0.0f32; 3], 0.0);
+        for (v, _) in f.iter().zip(&known).filter(|(_, kn)| **kn) {
+            (0..3).for_each(|i| m[i] += v[i]);
+            k += 1.0;
+        }
+        m.map(|v| v / k)
+    };
+    for (v, _) in f.iter_mut().zip(&known).filter(|(_, kn)| !**kn) {
+        *v = mean;
+    }
+    for _ in 0..400 {
+        let prev = f.clone();
+        for y in 0..gh {
+            for x in 0..gw {
+                let i = y * gw + x;
+                if known[i] {
+                    continue;
+                }
+                let mut acc = [0.0f32; 3];
+                let mut k = 0.0;
+                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                    if nx >= 0 && ny >= 0 && (nx as usize) < gw && (ny as usize) < gh {
+                        let p = prev[ny as usize * gw + nx as usize];
+                        (0..3).for_each(|c| acc[c] += p[c]);
+                        k += 1.0;
+                    }
+                }
+                f[i] = acc.map(|v| v / k);
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            // Lecture bilinéaire du champ de correction.
+            let (fx, fy) = ((x as f32 + 0.5) * g - 0.5, (y as f32 + 0.5) * g - 0.5);
+            let (x0, y0) = (fx.floor().clamp(0.0, (gw - 1) as f32) as usize, fy.floor().clamp(0.0, (gh - 1) as f32) as usize);
+            let (x1, y1) = ((x0 + 1).min(gw - 1), (y0 + 1).min(gh - 1));
+            let (tx, ty) = ((fx - x0 as f32).clamp(0.0, 1.0), (fy - y0 as f32).clamp(0.0, 1.0));
+            let p = out.get_pixel_mut(x, y);
+            for c in 0..3 {
+                let top = f[y0 * gw + x0][c] * (1.0 - tx) + f[y0 * gw + x1][c] * tx;
+                let bot = f[y1 * gw + x0][c] * (1.0 - tx) + f[y1 * gw + x1][c] * tx;
+                p[c] = (p[c] as f32 + top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
 /// Génère le contenu de la zone peinte et renvoie la pièce à poser sur la photo,
 /// avec l'invite traduite si elle l'a été.
 pub fn generate(img: &impl Canvas, strokes: &[BrushStroke], req: &Request) -> Result<(Patch, Option<String>)> {
@@ -553,7 +630,8 @@ pub fn generate(img: &impl Canvas, strokes: &[BrushStroke], req: &Request) -> Re
     let mut png = Vec::new();
     small.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
     let (out, translated) = prepared(req, |req| run(req, &png, &rc))?;
-    let out = image::imageops::resize(&out, rw, rh, image::imageops::FilterType::CatmullRom);
+    let mut out = image::imageops::resize(&out, rw, rh, image::imageops::FilterType::CatmullRom);
+    match_context(&mut out, &crop, &hole);
     let soft = blur(&hole, rw, rh, ((rw.max(rh) / 300) as usize).max(2));
     let px = out
         .pixels()
@@ -578,6 +656,19 @@ mod tests {
         assert!(is_vision(&m("qwen25-vl:7b", &["qwen25vl"])));
         assert!(!is_vision(&m("qwen3-fast:4b", &["qwen3"])));
         assert!(!is_vision(&m("gpt-oss-work:latest", &["gptoss"])));
+    }
+
+    #[test]
+    fn context_colours_are_matched() {
+        // Fond bleu ; le modèle a rendu toute la pièce plus claire (+40) : après raccord, le fond de la zone
+        // retrouve la teinte de la photo.
+        let (w, h) = (120u32, 100u32);
+        let orig = image::RgbaImage::from_pixel(w, h, image::Rgba([90, 120, 200, 255]));
+        let mut out = image::RgbImage::from_pixel(w, h, image::Rgb([130, 160, 240]));
+        let hole: Vec<f32> = (0..w * h).map(|i| if (30..90).contains(&(i % w)) && (25..75).contains(&(i / w)) { 1.0 } else { 0.0 }).collect();
+        match_context(&mut out, &orig, &hole);
+        let p = out.get_pixel(60, 50);
+        assert!(p.0.iter().zip([90u8, 120, 200]).all(|(a, b)| (*a as i32 - b as i32).abs() <= 2), "{p:?}");
     }
 
     #[test]

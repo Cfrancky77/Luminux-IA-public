@@ -477,6 +477,8 @@ pub struct App {
     erase_strokes: Vec<BrushStroke>,
     /// Forme de sélection de la gomme et de la génération : 0 pinceau, 1 lasso, 2 rectangle.
     select_shape: u8,
+    /// Sélection : 0 ajoute à la zone, 1 en retire (comme Alt, que le bureau prend souvent pour déplacer la fenêtre).
+    select_remove: u8,
     /// Gomme par remplissage simple (rapide), sans LaMa.
     erase_smooth: bool,
     erase_job: Option<EraseJob>,
@@ -672,6 +674,7 @@ impl App {
             retouch_tool: None,
             erase_strokes: Vec::new(),
             select_shape: 0,
+            select_remove: 0,
             erase_smooth: false,
             layer_sel: 0,
             erase_job: None,
@@ -3392,6 +3395,10 @@ impl App {
                     ui.add_sized([110.0, 18.0], egui::Label::new(t!("Sélection")).truncate());
                     segmented(ui, &mut self.select_shape, &[(0, t!("Pinceau")), (1, t!("Lasso")), (2, t!("Rectangle"))]);
                 });
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 18.0], egui::Label::new(t!("Action")).truncate());
+                    segmented(ui, &mut self.select_remove, &[(0, t!("Ajouter")), (1, t!("Retirer"))]);
+                });
             }
             if tool == RetouchTool::Heal || self.select_shape == 0 {
             ui.horizontal(|ui| {
@@ -3424,9 +3431,9 @@ impl App {
                     segmented(ui, &mut self.erase_smooth, &[(false, t!("IA (LaMa)")), (true, t!("Fond uni (rapide)"))]);
                 });
                 ui.small(match (self.select_shape, self.erase_smooth) {
-                    (0, false) => t!("Peins l'objet (Alt pour retirer), puis « Effacer ». Le calcul prend quelques secondes."),
-                    (0, true) => t!("Peins l'objet (Alt pour retirer), puis « Effacer ». Fond uni : pour un ciel, un mur, une peau ; instantané."),
-                    _ => t!("Entoure l'objet (Alt pour retirer une zone), puis « Effacer ». Plusieurs zones possibles."),
+                    (0, false) => t!("Peins l'objet (« Retirer » ou Alt pour enlever une partie), puis « Effacer ». Le calcul prend quelques secondes."),
+                    (0, true) => t!("Peins l'objet (« Retirer » ou Alt pour enlever une partie), puis « Effacer ». Fond uni : pour un ciel, un mur, une peau ; instantané."),
+                    _ => t!("Entoure l'objet (« Retirer » ou Alt pour enlever une zone), puis « Effacer ». Plusieurs zones possibles."),
                 });
                 ui.horizontal(|ui| {
                     let ready = !self.erase_strokes.is_empty() && self.erase_job.is_none();
@@ -3484,7 +3491,7 @@ impl App {
             }
         });
         slider(ui, t!("Force"), &mut self.gen_strength, 0.3..=1.0, 1.0);
-        ui.small(t!("Peins la zone (Alt pour retirer), puis « Générer ». Force < 1 garde la forme d'origine (sauf modèle inpainting)."));
+        ui.small(t!("Peins la zone (« Retirer » ou Alt pour enlever une partie), puis « Générer ». Force < 1 garde la forme d'origine (sauf modèle inpainting)."));
         let new_seed = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64 & 0xffff_ffff_ffff);
         ui.horizontal(|ui| {
             let ready = !self.erase_strokes.is_empty() && self.erase_job.is_none() && self.gen_ready() && !self.gen_prompt.trim().is_empty();
@@ -3937,7 +3944,7 @@ impl App {
                 }
             }
             RetouchTool::Erase | RetouchTool::Generate => {
-                let erase = ui.input(|i| i.modifiers.alt);
+                let erase = self.select_remove == 1 || ui.input(|i| i.modifiers.alt);
                 let shape = self.select_shape;
                 let started = resp.drag_started_by(egui::PointerButton::Primary);
                 // Lasso et rectangle : un simple clic ne sélectionne rien.

@@ -3,6 +3,14 @@
 Toutes les versions de Luminux IA, de la plus récente à la plus ancienne. Chaque release GitHub
 reprend la section de sa version.
 
+## [0.28.3] - 2026-10-21
+
+- Générer : la teinte du fond de la zone générée est raccordée à celle de la photo autour (fini le carré
+  plus clair visible avec le moteur local).
+- Gomme IA et Générer : bouton « Ajouter / Retirer » pour enlever une partie de la sélection sans Alt
+  (le bureau prend souvent Alt + glisser pour déplacer la fenêtre).
+- Copier, couper et coller (Ctrl+C, Ctrl+X, Ctrl+V) fonctionnent dans les zones de texte.
+
 ## [0.28.2] - 2026-10-21
 
 - Dépôt public Cfrancky77/Luminux-IA-public : code source et AppImage de chaque version, sans l'historique
