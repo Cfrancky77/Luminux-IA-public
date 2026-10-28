@@ -479,8 +479,16 @@ pub struct App {
     select_shape: u8,
     /// Sélection : 0 ajoute à la zone, 1 en retire (comme Alt, que le bureau prend souvent pour déplacer la fenêtre).
     select_remove: u8,
+    /// Masque IA demandé comme sélection de la Gomme ou de Générer, posé dès qu'il est calculé.
+    select_from: Option<Model>,
+    /// Masques IA posés dans la sélection en cours (boutons en surbrillance) : modèle, premier trait, nombre.
+    select_used: Vec<(Model, usize, usize)>,
     /// Gomme par remplissage simple (rapide), sans LaMa.
     erase_smooth: bool,
+    /// Gomme par le moteur de génération (ComfyUI ou local) au lieu de LaMa.
+    erase_diffusion: bool,
+    /// Gomme par diffusion : passe précise (objets séparés et longs découpés), plus lente.
+    erase_zones: bool,
     erase_job: Option<EraseJob>,
     /// Débruitage IA : résultat chargé (fichier de cache, image), calcul en cours, échec (fichier),
     /// et état envoyé au GPU (modèle, intensité, résultat chargé).
@@ -675,7 +683,11 @@ impl App {
             erase_strokes: Vec::new(),
             select_shape: 0,
             select_remove: 0,
+            select_from: None,
+            select_used: Vec::new(),
             erase_smooth: false,
+            erase_diffusion: false,
+            erase_zones: false,
             layer_sel: 0,
             erase_job: None,
             denoise_img: None,
@@ -1841,6 +1853,7 @@ impl App {
                 self.denoise_failed = None;
                 self.erase_failed.clear();
                 self.erase_strokes.clear();
+                self.select_from = None;
             }
             Err(e) => {
                 self.status = tf!("Échec GPU : {e:#}", e);
@@ -1892,6 +1905,7 @@ impl App {
                     negative: self.settings.comfy_negative.clone(),
                     seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64 & 0xffff_ffff_ffff),
                     strength: 1.0,
+                    zones: false,
                 });
                 self.status = t!("Génération de l'image en cours…").into();
             }
@@ -2124,9 +2138,16 @@ impl App {
                 "jpg" => t!("8 bits, lu partout."),
                 "webp" => t!("8 bits, environ un tiers plus léger que le JPEG à qualité égale. Navigateurs et logiciels récents."),
                 "avif" => t!("8 bits, le plus léger, encodage plus lent. Toujours en sRGB."),
-                "png" => t!("16 bits, sans perte, fichiers lourds."),
-                _ => t!("16 bits, sans perte, pour l'impression ou un autre logiciel."),
+                "png" => t!("Sans perte : bien plus lourd qu'un JPEG."),
+                _ => t!("Sans perte, pour l'impression ou un autre logiciel."),
             });
+            if f == "png" || f == "tif" {
+                ui.horizontal(|ui| {
+                    ui.label(t!("Profondeur"));
+                    segmented(ui, &mut o.deep, &[(false, t!("8 bits")), (true, t!("16 bits"))]);
+                });
+                ui.small(if o.deep { t!("Pour un RAW ou une retouche dans un autre logiciel ; fichier deux fois plus lourd.") } else { t!("Suffisant pour une photo JPEG ou de téléphone.") });
+            }
             self.settings.batch_format = f;
             let avif = self.settings.batch_format == "avif";
             ui.add_space(4.0);
@@ -2434,7 +2455,7 @@ impl App {
         }
         // Masque IA manquant : on lance son calcul (un à la fois), à partir de la source sans réglages.
         if self.ai_job.is_none() {
-            let extra = [self.depth_show_mask.then_some(Model::Depth), self.cutout_active.then_some(Model::Subject)];
+            let extra = [self.depth_show_mask.then_some(Model::Depth), self.cutout_active.then_some(Model::Subject), self.select_from];
             let want = ai::needed(&self.adj).into_iter().chain(extra.into_iter().flatten()).find(|m| !self.ai_masks.contains_key(m) && !self.ai_failed.contains(m));
             if let (Some(model), Some(photo)) = (want, self.path.clone()) {
                 match ai::render_guide(dev, &rs.device, &rs.queue) {
@@ -3247,45 +3268,45 @@ impl App {
 
     fn locals_ui(&mut self, ui: &mut egui::Ui) {
         let full = self.adj.locals.len() >= MAX_LOCALS;
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!full, egui::Button::new(t!("+ Pinceau"))).clicked() {
+        ui.small(t!("Un réglage local ne touche qu'une partie de la photo : choisis la zone (dessinée ou détectée), puis règle-la avec les curseurs du dessous."));
+        ui.label(egui::RichText::new(t!("Dessiner la zone")).strong());
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!full, egui::Button::selectable(self.adj.locals.iter().any(|l| matches!(l.shape, Shape::Brush { .. })), t!("+ Pinceau"))).on_hover_text(t!("Tu peins la zone toi-même")).clicked() {
                 self.add_local(Shape::Brush { strokes: vec![] }, t!("Pinceau"));
             }
-            if ui.add_enabled(!full, egui::Button::new(t!("+ Linéaire"))).on_hover_text(t!("Dégradé : effet plein au point plein, nul au point creux")).clicked() {
+            if ui.add_enabled(!full, egui::Button::selectable(self.adj.locals.iter().any(|l| matches!(l.shape, Shape::Linear { .. })), t!("+ Linéaire"))).on_hover_text(t!("Dégradé : effet plein au point plein, nul au point creux")).clicked() {
                 self.add_local(Shape::Linear { a: [0.5, 0.15], b: [0.5, 0.5] }, t!("Dégradé"));
             }
-            if ui.add_enabled(!full, egui::Button::new(t!("+ Radial"))).clicked() {
+            if ui.add_enabled(!full, egui::Button::selectable(self.adj.locals.iter().any(|l| matches!(l.shape, Shape::Radial { .. })), t!("+ Radial"))).on_hover_text(t!("Ellipse à bord adouci")).clicked() {
                 self.add_local(Shape::Radial { center: [0.5, 0.5], radius: [0.2, 0.2], angle: 0.0, feather: 0.5 }, t!("Radial"));
             }
         });
-        ui.horizontal(|ui| {
-            for (kind, label, name, tip) in [
-                (AiKind::Sky, t!("+ Ciel IA"), t!("Ciel"), t!("Masque du ciel détecté automatiquement")),
-                (AiKind::Subject, t!("+ Sujet IA"), t!("Sujet"), t!("Masque du sujet principal (personne, objet…)")),
-                (AiKind::Background, t!("+ Arrière-plan IA"), t!("Arrière-plan"), t!("Tout sauf le sujet principal")),
-            ] {
-                if ui.add_enabled(!full, egui::Button::new(label)).on_hover_text(tip).clicked() {
-                    self.add_local(Shape::Ai { kind, strokes: vec![] }, name);
-                }
-            }
-        });
-        ui.label(t!("Masques de la scène (IA)"));
+        ui.label(egui::RichText::new(t!("Détecter la zone (IA)")).strong());
         ui.horizontal_wrapped(|ui| {
-            for (kind, name) in [
-                (AiKind::People, t!("Personnes")),
-                (AiKind::Buildings, t!("Bâtiments")),
-                (AiKind::Vegetation, t!("Végétation")),
-                (AiKind::Water, t!("Eau")),
-                (AiKind::Mountains, t!("Montagnes")),
-                (AiKind::Ground, t!("Sol")),
+            for (kind, name, tip) in [
+                (AiKind::Sky, t!("Ciel"), t!("Masque du ciel détecté automatiquement")),
+                (AiKind::Subject, t!("Sujet"), t!("Masque du sujet principal (personne, objet…)")),
+                (AiKind::Background, t!("Arrière-plan"), t!("Tout sauf le sujet principal")),
+                (AiKind::People, t!("Personnes"), ""),
+                (AiKind::Buildings, t!("Bâtiments"), ""),
+                (AiKind::Vegetation, t!("Végétation"), ""),
+                (AiKind::Water, t!("Eau"), ""),
+                (AiKind::Mountains, t!("Montagnes"), ""),
+                (AiKind::Ground, t!("Sol"), ""),
             ] {
-                if ui.add_enabled(!full, egui::Button::new(format!("+ {name}"))).clicked() {
+                let on = self.adj.locals.iter().any(|l| matches!(l.shape, Shape::Ai { kind: k, .. } if k == kind));
+                let b = ui.add_enabled(!full, egui::Button::selectable(on, format!("+ {name}")));
+                let b = if tip.is_empty() { b } else { b.on_hover_text(tip) };
+                if b.clicked() {
                     self.add_local(Shape::Ai { kind, strokes: vec![] }, name);
                 }
             }
         });
+        if full {
+            ui.small(t!("Huit réglages au plus : supprimes-en un pour en ajouter."));
+        }
         if self.adj.locals.is_empty() {
-            ui.small(t!("Ajoute un pinceau ou un dégradé, puis règle-le ci-dessous. Huit au maximum."));
+            ui.small(t!("Aucun réglage local pour l'instant."));
             return;
         }
         let mut remove = None;
@@ -3315,16 +3336,27 @@ impl App {
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.show_mask, t!("Voir le masque (M)"));
             ui.checkbox(&mut self.adj.locals[i].invert, t!("Inverser"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(t!("↺ Réinitialiser")).on_hover_text(t!("Remet l'opacité et les curseurs de ce réglage à zéro (la zone est gardée)")).clicked() {
+                    let l = &mut self.adj.locals[i];
+                    l.adj = LocalAdj::default();
+                    l.amount = 1.0;
+                    l.invert = false;
+                }
+            });
         });
         slider(ui, t!("Opacité"), &mut self.adj.locals[i].amount, 0.0..=1.0, 1.0);
+        if matches!(self.adj.locals[i].shape, Shape::Brush { .. } | Shape::Ai { .. }) {
+            self.brush_size_ui(ui, BRUSH_MIN..=0.3, 0.04);
+            slider(ui, t!("Dureté"), &mut self.brush.hardness, 0.0..=1.0, 0.5);
+            slider(ui, t!("Débit"), &mut self.brush.flow, 0.05..=1.0, 0.7);
+        }
         let l = &mut self.adj.locals[i];
         match &mut l.shape {
             Shape::Brush { strokes } | Shape::Ai { strokes, .. } => {
-                slider(ui, t!("Taille"), &mut self.brush.radius, BRUSH_MIN..=0.3, 0.04);
-                slider(ui, t!("Dureté"), &mut self.brush.hardness, 0.0..=1.0, 0.5);
-                slider(ui, t!("Débit"), &mut self.brush.flow, 0.05..=1.0, 0.7);
                 ui.horizontal(|ui| {
-                    ui.toggle_value(&mut self.brush.erase, t!("Gomme")).on_hover_text(t!("Ou maintenir Alt en peignant"));
+                    ui.add_sized([110.0, 18.0], egui::Label::new(t!("Pinceau")).truncate());
+                    segmented(ui, &mut self.brush.erase, &[(false, t!("Ajouter")), (true, t!("Retirer"))]);
                     if ui.button(t!("Effacer les traits")).clicked() {
                         strokes.clear();
                     }
@@ -3342,9 +3374,9 @@ impl App {
                             self.ai_failed.remove(&model);
                         }
                     }
-                    ui.small(t!("Le masque est détecté automatiquement. Peins pour l'étendre, Alt (ou Gomme) pour le réduire."));
+                    ui.small(t!("Le masque est détecté automatiquement. Peins avec « Ajouter » pour l'étendre, « Retirer » (ou Alt) pour le réduire."));
                 } else {
-                    ui.small(t!("Peins sur la photo. [ et ] : taille. Clic droit glissé : déplacer la vue."));
+                    ui.small(t!("Peins sur la photo avec « Ajouter », corrige avec « Retirer » (ou Alt). [ et ] : taille. Clic droit glissé : déplacer la vue."));
                 }
             }
             Shape::Radial { angle, feather, .. } => {
@@ -3365,6 +3397,26 @@ impl App {
         slider_with(ui, t!("Teinte"), &mut a.tint, -1.0..=1.0, 0.0, &tracks::TINT);
         slider_with(ui, t!("Saturation"), &mut a.saturation, -1.0..=1.0, 0.0, &tracks::SATURATION);
         slider(ui, t!("Clarté"), &mut a.clarity, -1.0..=1.0, 0.0);
+    }
+
+    /// Taille du pinceau en % de la largeur de la photo (échelle logarithmique), et la même en pixels.
+    fn brush_size_ui(&mut self, ui: &mut egui::Ui, range: std::ops::RangeInclusive<f32>, default: f32) {
+        ui.horizontal(|ui| {
+            ui.add_sized([110.0, 18.0], egui::Label::new(t!("Taille")).truncate());
+            let r = ui.add(egui::Slider::new(&mut self.brush.radius, range).logarithmic(true)
+                .custom_formatter(|v, _| if v < 0.005 { format!("{:.2} %", v * 200.0) } else { format!("{:.1} %", v * 200.0) })
+                .custom_parser(|t| t.trim().trim_end_matches('%').trim().replace(',', ".").parse::<f64>().ok().map(|v| v / 200.0)))
+                .on_hover_text(t!("Diamètre, en % de la largeur de la photo. Touches [ et ] pour réduire ou agrandir."));
+            if r.double_clicked() {
+                self.brush.radius = default;
+            }
+        });
+        if let Some((w, _)) = self.size {
+            ui.horizontal(|ui| {
+                ui.add_space(114.0);
+                ui.label(egui::RichText::new(tf!("soit {0} px sur la photo", (self.brush.radius * 2.0 * w as f32).round().max(1.0))).weak().small());
+            });
+        }
     }
 
     fn retouch_ui(&mut self, ui: &mut egui::Ui) {
@@ -3399,47 +3451,106 @@ impl App {
                     ui.add_sized([110.0, 18.0], egui::Label::new(t!("Action")).truncate());
                     segmented(ui, &mut self.select_remove, &[(0, t!("Ajouter")), (1, t!("Retirer"))]);
                 });
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 18.0], egui::Label::new(t!("Depuis l'IA")).truncate())
+                        .on_hover_text(t!("Sélectionne d'un clic ce que l'IA détecte (ajouté ou retiré selon l'action)"));
+                    ui.horizontal_wrapped(|ui| {
+                        for (m, name) in [
+                            (Model::Subject, t!("Sujet")),
+                            (Model::People, t!("Personnes")),
+                            (Model::Buildings, t!("Bâtiments")),
+                            (Model::Vegetation, t!("Végétation")),
+                            (Model::Sky, t!("Ciel")),
+                        ] {
+                            let used = self.select_used.iter().position(|u| u.0 == m);
+                            let on = self.select_from == Some(m) || used.is_some();
+                            let tip = if used.is_some() { t!("Clic : retire cette sélection") } else { t!("Clic : sélectionne cette zone") };
+                            if ui.add_enabled(self.select_from.is_none(), egui::Button::selectable(on, name)).on_hover_text(tip).clicked() {
+                                if let Some(k) = used {
+                                    // Second clic : on enlève les traits posés par ce masque.
+                                    let (_, start, n) = self.select_used.remove(k);
+                                    if start + n <= self.erase_strokes.len() {
+                                        self.erase_strokes.drain(start..start + n);
+                                        for u in &mut self.select_used {
+                                            if u.1 > start {
+                                                u.1 -= n;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    self.ai_failed.remove(&m);
+                                    self.select_from = Some(m);
+                                }
+                            }
+                        }
+                    });
+                });
+                if let Some(m) = self.select_from {
+                    ui.horizontal(|ui| {
+                        ui.add_space(114.0);
+                        ui.spinner();
+                        ui.small(tf!("Détection {0} en cours…", m.of_what()));
+                    });
+                }
             }
             if tool == RetouchTool::Heal || self.select_shape == 0 {
-            ui.horizontal(|ui| {
-                ui.add_sized([110.0, 18.0], egui::Label::new(t!("Taille")).truncate());
-                let r = ui.add(egui::Slider::new(&mut self.brush.radius, range).logarithmic(true)
-                    .custom_formatter(|v, _| if v < 0.005 { format!("{:.2} %", v * 200.0) } else { format!("{:.1} %", v * 200.0) })
-                    .custom_parser(|t| t.trim().trim_end_matches('%').trim().replace(',', ".").parse::<f64>().ok().map(|v| v / 200.0)))
-                    .on_hover_text(t!("Diamètre, en % de la largeur de la photo. Touches [ et ] pour réduire ou agrandir."));
-                if r.double_clicked() {
-                    self.brush.radius = default;
-                }
-            });
-            // Le même diamètre en pixels de la photo.
-            if let Some((w, _)) = self.size {
-                ui.horizontal(|ui| {
-                    ui.add_space(114.0);
-                    ui.label(egui::RichText::new(tf!("soit {0} px sur la photo", (self.brush.radius * 2.0 * w as f32).round().max(1.0))).weak().small());
-                });
-            }
+                self.brush_size_ui(ui, range, default);
             }
         }
         match self.retouch_tool {
             Some(RetouchTool::Heal) => {
-                ui.small(t!("Clic sur une tache. Glisse le cercle pointillé pour choisir une autre source. [ et ] : taille."));
+                ui.small(t!("Clic sur une petite tache (poussière, bouton) : elle est remplacée par la zone du cercle pointillé bleu, choisie automatiquement. Glisse ce cercle pour copier ailleurs. Seuls les repères de la dernière tache et de celle survolée s'affichent. [ et ] : taille."));
                 ui.small(t!("Chaque clic corrige aussitôt, rien à valider : « Retirer la dernière » ou Ctrl+Z pour revenir. Pour un objet long (pylône, fil), la Gomme IA convient mieux."));
             }
             Some(RetouchTool::Erase) => {
                 ui.horizontal(|ui| {
                     ui.add_sized([110.0, 18.0], egui::Label::new(t!("Remplissage")).truncate());
-                    segmented(ui, &mut self.erase_smooth, &[(false, t!("IA (LaMa)")), (true, t!("Fond uni (rapide)"))]);
+                    let mut mode = if self.erase_diffusion { 1u8 } else if self.erase_smooth { 2 } else { 0 };
+                    let diff = if self.settings.ai_local { t!("SD local") } else { "ComfyUI" };
+                    segmented(ui, &mut mode, &[(0, "LaMa"), (1, diff), (2, t!("Fond uni"))]);
+                    self.erase_diffusion = mode == 1;
+                    self.erase_smooth = mode == 2;
                 });
+                if self.erase_diffusion {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([110.0, 18.0], egui::Label::new(t!("Passe")).truncate());
+                        let mut z = self.erase_zones as u8;
+                        segmented(ui, &mut z, &[(0, t!("Rapide")), (1, t!("Précise"))]);
+                        self.erase_zones = z == 1;
+                    });
+                    ui.small(t!("LaMa efface, puis le moteur de Générer repasse à mi-force pour une texture plus naturelle. Plus lent : quelques dizaines de secondes par groupe d'objets. Rien à écrire."));
+                    if self.erase_zones {
+                        ui.small(t!("Précise : chaque groupe de personnes est traité à part, et une longue foule en 2 ou 3 tranches. Plus net, mais 2 à 3 fois plus long."));
+                    }
+                    if !self.gen_ready() {
+                        ui.colored_label(Color32::from_rgb(230, 120, 90), t!("Choisis d'abord un modèle dans l'outil Générer."));
+                    }
+                }
                 ui.small(match (self.select_shape, self.erase_smooth) {
                     (0, false) => t!("Peins l'objet (« Retirer » ou Alt pour enlever une partie), puis « Effacer ». Le calcul prend quelques secondes."),
                     (0, true) => t!("Peins l'objet (« Retirer » ou Alt pour enlever une partie), puis « Effacer ». Fond uni : pour un ciel, un mur, une peau ; instantané."),
                     _ => t!("Entoure l'objet (« Retirer » ou Alt pour enlever une zone), puis « Effacer ». Plusieurs zones possibles."),
                 });
                 ui.horizontal(|ui| {
-                    let ready = !self.erase_strokes.is_empty() && self.erase_job.is_none();
+                    let ready = !self.erase_strokes.is_empty() && self.erase_job.is_none() && (!self.erase_diffusion || self.gen_ready());
                     if ui.add_enabled(ready, egui::Button::new(t!("Effacer"))).clicked() {
                         let strokes = std::mem::take(&mut self.erase_strokes);
-                        self.adj.retouch.push(Retouch::Erase { strokes, smooth: self.erase_smooth });
+                        if self.erase_diffusion {
+                            // Effacement par diffusion : invite fixe en anglais, objets à éviter ajoutés.
+                            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64 & 0xffff_ffff_ffff);
+                            let neg = self.settings.comfy_negative.trim();
+                            self.adj.retouch.push(Retouch::Generate {
+                                strokes,
+                                model: self.settings.gen_model(),
+                                prompt: crate::comfy::ERASE_PROMPT.to_string(),
+                                negative: if neg.is_empty() { crate::comfy::ERASE_NEGATIVE.to_string() } else { format!("{}, {neg}", crate::comfy::ERASE_NEGATIVE) },
+                                seed,
+                                strength: 1.0,
+                                zones: self.erase_zones,
+                            });
+                        } else {
+                            self.adj.retouch.push(Retouch::Erase { strokes, smooth: self.erase_smooth });
+                        }
                     }
                     if ui.add_enabled(!self.erase_strokes.is_empty(), egui::Button::new(t!("Recommencer"))).clicked() {
                         self.erase_strokes.clear();
@@ -3486,6 +3597,16 @@ impl App {
         ui.label(if self.settings.translate { t!("Ce qui doit apparaître") } else { t!("Ce qui doit apparaître (en anglais)") });
         ui.add(egui::TextEdit::multiline(&mut self.gen_prompt).desired_rows(2).desired_width(f32::INFINITY));
         ui.collapsing(t!("À éviter"), |ui| {
+            // Termes courants à cocher ; ils s'ajoutent au texte libre (en anglais, compris par les modèles).
+            ui.horizontal_wrapped(|ui| {
+                for (label, terms) in NEGATIVE_PRESETS {
+                    let on = negative_has(&self.settings.comfy_negative, terms);
+                    if ui.add(egui::Button::selectable(on, crate::i18n::tr(label))).on_hover_text(*terms).clicked() {
+                        self.settings.comfy_negative = negative_toggle(&self.settings.comfy_negative, terms, !on);
+                        self.settings.save();
+                    }
+                }
+            });
             if ui.add(egui::TextEdit::multiline(&mut self.settings.comfy_negative).desired_rows(2).desired_width(f32::INFINITY)).lost_focus() {
                 self.settings.save();
             }
@@ -3504,6 +3625,7 @@ impl App {
                     negative: self.settings.comfy_negative.clone(),
                     seed: new_seed(),
                     strength: self.gen_strength,
+                    zones: false,
                 });
             }
             if ui.add_enabled(!self.erase_strokes.is_empty(), egui::Button::new(t!("Recommencer"))).clicked() {
@@ -3893,12 +4015,21 @@ impl App {
             self.heal_drag = None;
             self.painting = false;
         }
-        // Retouches existantes : cercle plein (tache) et pointillé (source).
+        // Correcteur : repères (cercle plein = tache, pointillé = source) de la dernière tache et de celle
+        // que survole le pointeur seulement ; les autres restent cachés pour ne pas encombrer la photo.
+        let last_heal = adj.retouch.iter().rposition(|r| matches!(r, Retouch::Heal { .. }));
         for (k, r) in adj.retouch.iter().enumerate() {
+            if tool != RetouchTool::Heal {
+                break;
+            }
             if let Retouch::Heal { center, radius, offset } = r {
                 let rr = radius * src[0] * px_scale;
                 let c = to_screen(*center);
                 let s = to_screen([center[0] + offset[0], center[1] + offset[1]]);
+                let near = pointer.is_some_and(|q| q.distance(c) < rr.max(8.0) || q.distance(s) < rr.max(8.0));
+                if Some(k) != last_heal && Some(k) != self.heal_drag && !near {
+                    continue;
+                }
                 p.circle_stroke(c, rr, dark);
                 p.circle_stroke(c, rr, white);
                 let pts: Vec<Pos2> = (0..=48).map(|t| { let a = t as f32 / 48.0 * std::f32::consts::TAU; s + vec2(rr * a.cos(), rr * a.sin()) }).collect();
@@ -5180,7 +5311,7 @@ impl App {
                     }
                     FileTool::Expand => {
                         let translate = set.translate.then_some((set.ollama_url.as_str(), set.translate_model.as_str()));
-                        let req = crate::comfy::Request { url: &set.comfy_url, model: &set.gen_model(), prompt: &prompt, negative: &set.comfy_negative, seed, strength: 1.0, inpaint_denoise: None, ollama, translate };
+                        let req = crate::comfy::Request { url: &set.comfy_url, model: &set.gen_model(), prompt: &prompt, negative: &set.comfy_negative, seed, strength: 1.0, inpaint_denoise: None, refine: false, ollama, translate };
                         let (out, tr) = crate::comfy::expand(&img, margins, &req)?;
                         let msg = match tr {
                             Some(t) => tf!("Cadre agrandi (invite traduite : « {t} »)", t),
@@ -5596,6 +5727,46 @@ fn choice_list(ui: &mut egui::Ui, id: &str, value: &mut String, items: &[(String
     *value != before
 }
 
+/// Termes « à éviter » proposés en cases : libellé affiché, termes anglais ajoutés à l'invite négative.
+const NEGATIVE_PRESETS: &[(&str, &str)] = &[
+    (k!("Flou"), "blurry"),
+    (k!("Déformé"), "deformed"),
+    (k!("Basse définition"), "lowres"),
+    (k!("Texte"), "text"),
+    (k!("Filigrane"), "watermark"),
+    (k!("Fond blanc"), "white background"),
+    (k!("Halo"), "halo, glow"),
+    (k!("Cadre"), "frame, border"),
+    (k!("Dessin"), "cartoon, illustration"),
+    (k!("Mains ratées"), "bad hands, extra fingers"),
+];
+
+fn negative_terms(text: &str) -> Vec<String> {
+    text.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect()
+}
+
+/// Tous les termes de `terms` figurent-ils dans l'invite négative ?
+fn negative_has(text: &str, terms: &str) -> bool {
+    let have = negative_terms(text);
+    negative_terms(terms).iter().all(|t| have.contains(t))
+}
+
+/// Ajoute ou retire les termes de `terms`, sans toucher au reste du texte.
+fn negative_toggle(text: &str, terms: &str, on: bool) -> String {
+    let want = negative_terms(terms);
+    let mut parts: Vec<String> = text.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    if on {
+        for t in want {
+            if !parts.iter().any(|p| p.to_lowercase() == t) {
+                parts.push(t);
+            }
+        }
+    } else {
+        parts.retain(|p| !want.contains(&p.to_lowercase()));
+    }
+    parts.join(", ")
+}
+
 /// Formats de recadrage en tuiles dessinées (rectangle aux proportions du format).
 fn ratio_tiles(ui: &mut egui::Ui, sel: &mut usize, portrait: bool) {
     let cols = 4;
@@ -5900,6 +6071,23 @@ impl eframe::App for App {
                     self.status = tf!("Masque IA {0} impossible : le calcul s'est arrêté (détails dans le terminal).", job.model.of_what());
                 }
                 Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(250)),
+            }
+        }
+        if self.erase_strokes.is_empty() {
+            self.select_used.clear();
+        }
+        // Sélection depuis un masque IA : posée dès que le masque est là.
+        if let Some(m) = self.select_from {
+            if let Some(mask) = self.ai_masks.get(&m) {
+                // Personnes : l'ombre au sol part avec elles.
+                let down = match m { Model::People => 3, Model::Subject => 1, _ => 0 };
+                let strokes = crate::retouch::selection_from_mask(&mask.data, mask.w, mask.h, self.select_remove == 1, down);
+                self.status = if strokes.is_empty() { tf!("Détection {0} : rien trouvé.", m.of_what()) } else { tf!("Sélection {0} posée : corrige-la au pinceau si besoin.", m.of_what()) };
+                self.select_used.push((m, self.erase_strokes.len(), strokes.len()));
+                self.erase_strokes.extend(strokes);
+                self.select_from = None;
+            } else if self.ai_failed.contains(&m) {
+                self.select_from = None;
             }
         }
         if let Some((_, rx)) = &self.lang_job {
@@ -6289,5 +6477,18 @@ impl eframe::App for App {
         if let Some(rs) = &rs {
             self.sync_gpu(rs, &ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod negative_tests {
+    #[test]
+    fn negative_presets_toggle() {
+        let t = super::negative_toggle("blurry, Text, my own", "halo, glow", true);
+        assert_eq!(t, "blurry, Text, my own, halo, glow");
+        assert!(super::negative_has(&t, "halo, glow") && super::negative_has(&t, "text"));
+        let t = super::negative_toggle(&t, "text", false);
+        assert_eq!(t, "blurry, my own, halo, glow");
+        assert!(!super::negative_has(&t, "frame, border"));
     }
 }

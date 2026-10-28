@@ -230,6 +230,77 @@ pub struct Patch {
     pub px: Vec<[f32; 4]>,
 }
 
+/// Sélection de retouche tirée d'un masque IA (`w`x`h`, 0..1) : des rectangles pleins sur une grille
+/// d'environ 192 cases en long, élargie d'une case pour couvrir le bord adouci du masque.
+/// `erase` : la sélection est retirée au lieu d'être ajoutée. `down` : cases ajoutées sous l'objet
+/// (ombre portée au sol d'une personne).
+pub(crate) fn selection_from_mask(data: &[f32], w: u32, h: u32, erase: bool, down: usize) -> Vec<BrushStroke> {
+    let cell = (w.max(h) as f32 / 192.0).max(1.0);
+    let (gw, gh) = (((w as f32 / cell).ceil() as usize).max(1), ((h as f32 / cell).ceil() as usize).max(1));
+    // Case retenue si une part notable de ses pixels est dans le masque.
+    let mut sum = vec![(0f32, 0u32); gw * gh];
+    for y in 0..h as usize {
+        let gy = ((y as f32 / cell) as usize).min(gh - 1);
+        for x in 0..w as usize {
+            let gx = ((x as f32 / cell) as usize).min(gw - 1);
+            let c = &mut sum[gy * gw + gx];
+            c.0 += data[y * w as usize + x];
+            c.1 += 1;
+        }
+    }
+    let on: Vec<bool> = sum.iter().map(|(v, n)| *n > 0 && v / *n as f32 > 0.3).collect();
+    let grown: Vec<bool> = (0..gw * gh)
+        .map(|i| {
+            let (x, y) = ((i % gw) as i64, (i / gw) as i64);
+            (-1..=1 + down as i64).any(|dy| (-1..=1).any(|dx| {
+                let (nx, ny) = (x + dx, y - dy);
+                nx >= 0 && ny >= 0 && nx < gw as i64 && ny < gh as i64 && on[ny as usize * gw + nx as usize]
+            }))
+        })
+        .collect();
+    // Plages par ligne, fusionnées avec la ligne du dessous quand elles sont identiques.
+    let mut open: Vec<(usize, usize, usize)> = Vec::new();
+    let mut rects = Vec::new();
+    for y in 0..=gh {
+        let mut runs = Vec::new();
+        if y < gh {
+            let mut x = 0;
+            while x < gw {
+                if grown[y * gw + x] {
+                    let x0 = x;
+                    while x < gw && grown[y * gw + x] {
+                        x += 1;
+                    }
+                    runs.push((x0, x));
+                } else {
+                    x += 1;
+                }
+            }
+        }
+        let mut next = Vec::new();
+        for (x0, x1, y0) in open.drain(..) {
+            if let Some(k) = runs.iter().position(|r| *r == (x0, x1)) {
+                runs.remove(k);
+                next.push((x0, x1, y0));
+            } else {
+                rects.push((x0, x1, y0, y));
+            }
+        }
+        next.extend(runs.into_iter().map(|(x0, x1)| (x0, x1, y)));
+        open = next;
+    }
+    let (fw, fh) = (gw as f32 * cell / w as f32, gh as f32 * cell / h as f32);
+    rects
+        .into_iter()
+        .map(|(x0, x1, y0, y1)| {
+            let (a, b) = (x0 as f32 / gw as f32 * fw, x1 as f32 / gw as f32 * fw);
+            let (c, d) = (y0 as f32 / gh as f32 * fh, y1 as f32 / gh as f32 * fh);
+            let (b, d) = (b.min(1.0), d.min(1.0));
+            BrushStroke { points: vec![[a, c], [b, c], [b, d], [a, d]], radius: 0.0005, hardness: 0.9, flow: 1.0, erase, fill: true }
+        })
+        .collect()
+}
+
 /// Masque des traits dans un rectangle en pixels, et le rectangle (agrandi pour donner du contexte).
 pub(crate) fn erase_area(strokes: &[BrushStroke], w: u32, h: u32) -> Option<([i32; 4], Vec<f32>)> {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -243,7 +314,8 @@ pub(crate) fn erase_area(strokes: &[BrushStroke], w: u32, h: u32) -> Option<([i3
             y1 = y1.max(y + r);
         }
     }
-    if x0 > x1 {
+    // Traits entièrement hors de la photo (pinceau passé dans la marge) : rien à effacer.
+    if x0 > x1 || x1 < 0.0 || y1 < 0.0 || x0 > w as f32 || y0 > h as f32 {
         return None;
     }
     // Contexte autour de l'objet : la moitié de sa taille, 48 px au moins, 8 % du côté de la photo au plus
@@ -281,6 +353,111 @@ pub(crate) fn to_srgb(x: f32) -> f32 {
 /// Calcule la gomme sur l'image (dans son état courant). `use_ai` : LaMa si possible.
 pub fn compute_erase(img: &impl Canvas, strokes: &[BrushStroke], use_ai: bool) -> Result<(Patch, bool)> {
     let (w, h) = img.size();
+    let groups = erase_groups(strokes, w, h);
+    if groups.is_empty() {
+        anyhow::bail!("aucune zone peinte");
+    }
+    if groups.len() <= 1 {
+        return erase_one(img, strokes, use_ai, false);
+    }
+    // Objets éloignés (des passants dispersés) : chacun est effacé dans son propre cadre, à pleine
+    // définition, au lieu d'un seul grand cadre que LaMa réduit à 512 px (traînées floues).
+    let mut parts = Vec::new();
+    let mut used_ai = false;
+    for g in &groups {
+        let (p, ai) = erase_one(img, g, use_ai, false)?;
+        used_ai |= ai;
+        parts.push(p);
+    }
+    Ok((merge_patches(&parts, w, h), used_ai))
+}
+
+/// Pièces de plusieurs cadres réunies en une seule, sur le cadre qui les contient toutes.
+fn merge_patches(parts: &[Patch], w: u32, h: u32) -> Patch {
+    let px_rect = |p: &Patch| [(p.rect[0] * w as f32).round() as i32, (p.rect[1] * h as f32).round() as i32];
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for p in parts {
+        let [px, py] = px_rect(p);
+        x0 = x0.min(px);
+        y0 = y0.min(py);
+        x1 = x1.max(px + p.w as i32);
+        y1 = y1.max(py + p.h as i32);
+    }
+    let (mw, mh) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    let mut px = vec![[0f32; 4]; (mw * mh) as usize];
+    for p in parts {
+        let [ox, oy] = px_rect(p);
+        for y in 0..p.h {
+            for x in 0..p.w {
+                let q = p.px[(y * p.w + x) as usize];
+                let o = &mut px[((oy - y0) as u32 + y) as usize * mw as usize + ((ox - x0) as u32 + x) as usize];
+                // Cadres voisins qui se touchent : on garde la pièce la plus opaque.
+                if q[3] > o[3] {
+                    *o = q;
+                }
+            }
+        }
+    }
+    let rect = [x0 as f32 / w as f32, y0 as f32 / h as f32, mw as f32 / w as f32, mh as f32 / h as f32];
+    Patch { rect, w: mw, h: mh, px }
+}
+
+/// Traits de gomme regroupés par objet : deux traits d'ajout sont du même groupe si leurs cadres,
+/// élargis de 3 % de la photo, se touchent. Les traits de retrait vont dans chaque groupe.
+fn erase_groups(strokes: &[BrushStroke], w: u32, h: u32) -> Vec<Vec<BrushStroke>> {
+    erase_groups_by(strokes, w, h, 0.03)
+}
+
+/// `gap` : écart (en part du grand côté) en dessous duquel deux traits forment un même groupe.
+fn erase_groups_by(strokes: &[BrushStroke], w: u32, h: u32, gap: f32) -> Vec<Vec<BrushStroke>> {
+    let m = w.max(h) as f32 * gap;
+    // Un trait hors de la photo formerait un groupe sans pixel (cadre inversé, allocation démesurée).
+    let inside = |s: &BrushStroke| erase_area(std::slice::from_ref(s), w, h).is_some();
+    let adds: Vec<usize> = (0..strokes.len()).filter(|&i| !strokes[i].erase && !strokes[i].points.is_empty() && inside(&strokes[i])).collect();
+    let bbox: Vec<[f32; 4]> = adds
+        .iter()
+        .map(|&i| {
+            let s = &strokes[i];
+            let r = s.radius * w as f32 + m;
+            s.points.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, p| {
+                let (x, y) = (p[0] * w as f32, p[1] * h as f32);
+                [b[0].min(x - r), b[1].min(y - r), b[2].max(x + r), b[3].max(y + r)]
+            })
+        })
+        .collect();
+    let mut parent: Vec<usize> = (0..adds.len()).collect();
+    fn find(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    for a in 0..adds.len() {
+        for b in a + 1..adds.len() {
+            let (p, q) = (bbox[a], bbox[b]);
+            if p[0] <= q[2] && q[0] <= p[2] && p[1] <= q[3] && q[1] <= p[3] {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                parent[ra] = rb;
+            }
+        }
+    }
+    let mut groups: Vec<(usize, Vec<BrushStroke>)> = Vec::new();
+    for k in 0..adds.len() {
+        let root = find(&mut parent, k);
+        match groups.iter_mut().find(|g| g.0 == root) {
+            Some(g) => g.1.push(strokes[adds[k]].clone()),
+            None => groups.push((root, vec![strokes[adds[k]].clone()])),
+        }
+    }
+    let removes: Vec<BrushStroke> = strokes.iter().filter(|s| s.erase).cloned().collect();
+    groups.into_iter().map(|(_, mut g)| { g.extend(removes.iter().cloned()); g }).collect()
+}
+
+/// `raw` : sortie LaMa telle quelle, sans y recopier des morceaux de la photo (base de la gomme par
+/// diffusion : les morceaux recopiés, un pan de kiosque par exemple, devenaient un mur une fois repassés).
+fn erase_one(img: &impl Canvas, strokes: &[BrushStroke], use_ai: bool, raw: bool) -> Result<(Patch, bool)> {
+    let (w, h) = img.size();
     let (r, mask) = erase_area(strokes, w, h).ok_or_else(|| anyhow::anyhow!("aucun trait"))?;
     let (rw, rh) = ((r[2] - r[0]) as u32, (r[3] - r[1]) as u32);
     let crop: Vec<[f32; 4]> = (0..rh as i32)
@@ -307,6 +484,7 @@ pub fn compute_erase(img: &impl Canvas, strokes: &[BrushStroke], use_ai: bool) -
     let filled = match (filled, use_ai) {
         // LaMa travaille en 512x512 : sa texture, trop lisse une fois agrandie, est remplacée
         // par des morceaux de la photo choisis d'après son résultat.
+        (Some(f), _) if raw => f,
         (Some(f), _) => crate::inpaint::fill(&crop, &hole, rw, rh, Some(&f)),
         // LaMa indisponible : texture prise autour du trou.
         (None, true) => crate::inpaint::fill(&crop, &hole, rw, rh, None),
@@ -459,6 +637,188 @@ fn lama(crop: &[[f32; 4]], hole: &[f32], w: u32, h: u32) -> Result<Vec<[f32; 4]>
     }).collect())
 }
 
+/// Taille visée d'une tranche (en pixels de la photo) en passe précise.
+const ZONE_SIDE: f32 = 768.0;
+
+/// Gomme par diffusion d'un groupe d'objets : LaMa brute puis passe à mi-force.
+/// `zones` : un groupe trop long (une foule au pied des façades) est découpé en 2 ou 3 tranches qui se
+/// chevauchent, chacune traitée près de la résolution du modèle au lieu d'être réduite puis agrandie (flou).
+/// Chaque tranche voit les précédentes déjà effacées. `saved(suffixe)` garde les fichiers de diagnostic.
+fn erase_diffuse(img: &impl Canvas, g: &[BrushStroke], req: &crate::comfy::Request, zones: bool, saved: &dyn Fn(&str)) -> Result<Option<Patch>> {
+    let (w, h) = img.size();
+    fn one<C: Canvas>(cv: &C, st: &[BrushStroke], req: &crate::comfy::Request) -> Result<Option<Patch>> {
+        let (pre, _) = erase_one(cv, st, true, true)?;
+        // Objet entièrement retiré par des traits « Retirer » : rien à envoyer au moteur.
+        if pre.px.iter().all(|p| p[3] < 0.01) {
+            return Ok(None);
+        }
+        let (cw, ch) = cv.size();
+        let over = Over { base: cv, patch: &pre, x0: (pre.rect[0] * cw as f32).round() as i32, y0: (pre.rect[1] * ch as f32).round() as i32 };
+        crate::comfy::generate(&over, st, req).map(|r| Some(r.0))
+    }
+    let (r, _) = erase_area(g, w, h).ok_or_else(|| anyhow::anyhow!("aucune zone peinte"))?;
+    let (rw, rh) = ((r[2] - r[0]) as f32, (r[3] - r[1]) as f32);
+    let horiz = rw >= rh;
+    let long = rw.max(rh);
+    let n = if zones { ((long / ZONE_SIDE).ceil() as usize).clamp(1, 3) } else { 1 };
+    if n == 1 {
+        let p = one(img, g, req)?;
+        saved("");
+        return Ok(p);
+    }
+    // Recouvrement des trous de deux tranches voisines, et contexte visible de chaque côté.
+    let (overlap, ctx) = (48.0, 160.0);
+    let (start, size) = if horiz { (r[0] as f32, w as f32) } else { (r[1] as f32, h as f32) };
+    let mut parts: Vec<Patch> = Vec::new();
+    for k in 0..n {
+        let a = start + long * k as f32 / n as f32;
+        let b = start + long * (k + 1) as f32 / n as f32;
+        let ha = if k == 0 { -1e6 } else { a - overlap };
+        let (wa, wb) = ((a - ctx).floor().max(0.0), (b + ctx).ceil().min(size));
+        let win_rect = if horiz { [wa as i32, 0, wb as i32, h as i32] } else { [0, wa as i32, w as i32, wb as i32] };
+        let (ww, wh) = ((win_rect[2] - win_rect[0]) as u32, (win_rect[3] - win_rect[1]) as u32);
+        let stack = Stack { base: img, parts: &parts };
+        let win = Window { base: &stack, x0: win_rect[0], y0: win_rect[1], w: ww, h: wh };
+        let to_win = |p: &[f32; 2]| [(p[0] * w as f32 - win_rect[0] as f32) / ww as f32, (p[1] * h as f32 - win_rect[1] as f32) / wh as f32];
+        let mut st: Vec<BrushStroke> = g.iter().map(|s| BrushStroke { points: s.points.iter().map(to_win).collect(), radius: s.radius * w as f32 / ww as f32, ..s.clone() }).collect();
+        // Avant la tranche : retiré (déjà effacé par la précédente, qui sert de contexte). Après : gardé dans
+        // le trou jusqu'au bord du cadre, sinon les objets suivants serviraient de contexte et
+        // déteindraient ; la tranche suivante repasse dessus.
+        let lim = |v: f32| (v - wa) / (wb - wa);
+        let clip = |u0: f32, u1: f32| {
+            let pts = if horiz { vec![[u0, -1.0], [u1, -1.0], [u1, 2.0], [u0, 2.0]] } else { vec![[-1.0, u0], [2.0, u0], [2.0, u1], [-1.0, u1]] };
+            BrushStroke { points: pts, radius: 0.0005, hardness: 1.0, flow: 1.0, erase: true, fill: true }
+        };
+        if k > 0 {
+            st.push(clip(-1.0, lim(ha)));
+        }
+        if erase_area(&st, ww, wh).is_none() {
+            continue;
+        }
+        let p = one(&win, &st, req)?;
+        saved(&format!("-{}", k + 1));
+        if let Some(p) = p {
+            let rect = [(win_rect[0] as f32 + p.rect[0] * ww as f32) / w as f32, (win_rect[1] as f32 + p.rect[1] * wh as f32) / h as f32, p.rect[2] * ww as f32 / w as f32, p.rect[3] * wh as f32 / h as f32];
+            parts.push(Patch { rect, ..p });
+        }
+    }
+    Ok((!parts.is_empty()).then(|| stack_patches(&parts, w, h)))
+}
+
+/// Origine en pixels d'une pièce posée sur une image w x h.
+fn patch_origin(p: &Patch, w: u32, h: u32) -> (i32, i32) {
+    ((p.rect[0] * w as f32).round() as i32, (p.rect[1] * h as f32).round() as i32)
+}
+
+/// Pièces superposées dans l'ordre (la suivante par-dessus), réunies en une seule.
+fn stack_patches(parts: &[Patch], w: u32, h: u32) -> Patch {
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for p in parts {
+        let (px, py) = patch_origin(p, w, h);
+        x0 = x0.min(px);
+        y0 = y0.min(py);
+        x1 = x1.max(px + p.w as i32);
+        y1 = y1.max(py + p.h as i32);
+    }
+    let (mw, mh) = ((x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32);
+    let mut px = vec![[0f32; 4]; (mw * mh) as usize];
+    for p in parts {
+        let (ox, oy) = patch_origin(p, w, h);
+        for y in 0..p.h {
+            for x in 0..p.w {
+                let q = p.px[(y * p.w + x) as usize];
+                let o = &mut px[((oy - y0) as u32 + y) as usize * mw as usize + ((ox - x0) as u32 + x) as usize];
+                let a = q[3].clamp(0.0, 1.0);
+                let out = a + o[3] * (1.0 - a);
+                if out > 0.0 {
+                    for c in 0..3 {
+                        o[c] = (q[c] * a + o[c] * o[3] * (1.0 - a)) / out;
+                    }
+                }
+                o[3] = out;
+            }
+        }
+    }
+    let rect = [x0 as f32 / w as f32, y0 as f32 / h as f32, mw as f32 / w as f32, mh as f32 / h as f32];
+    Patch { rect, w: mw, h: mh, px }
+}
+
+/// Image avec des pièces déjà posées par-dessus, dans l'ordre (lecture seule).
+struct Stack<'a, C: Canvas> {
+    base: &'a C,
+    parts: &'a [Patch],
+}
+
+impl<C: Canvas> Canvas for Stack<'_, C> {
+    fn size(&self) -> (u32, u32) {
+        self.base.size()
+    }
+    fn get(&self, x: i32, y: i32) -> [f32; 3] {
+        let (w, h) = self.base.size();
+        let mut d = self.base.get(x, y);
+        for p in self.parts {
+            let (ox, oy) = patch_origin(p, w, h);
+            let (px, py) = (x - ox, y - oy);
+            if px < 0 || py < 0 || px >= p.w as i32 || py >= p.h as i32 {
+                continue;
+            }
+            let q = p.px[(py as u32 * p.w + px as u32) as usize];
+            let a = q[3].clamp(0.0, 1.0);
+            d = std::array::from_fn(|c| d[c] + (q[c] - d[c]) * a);
+        }
+        d
+    }
+    fn set(&mut self, _: i32, _: i32, _: [f32; 3]) {}
+}
+
+/// Morceau d'une image vu comme une image entière (lecture seule).
+struct Window<'a, C: Canvas> {
+    base: &'a C,
+    x0: i32,
+    y0: i32,
+    w: u32,
+    h: u32,
+}
+
+impl<C: Canvas> Canvas for Window<'_, C> {
+    fn size(&self) -> (u32, u32) {
+        (self.w, self.h)
+    }
+    fn get(&self, x: i32, y: i32) -> [f32; 3] {
+        self.base.get(self.x0 + x.clamp(0, self.w as i32 - 1), self.y0 + y.clamp(0, self.h as i32 - 1))
+    }
+    fn set(&mut self, _: i32, _: i32, _: [f32; 3]) {}
+}
+
+/// Force de la diffusion qui repasse sur l'effacement LaMa : assez pour une texture crédible,
+/// trop peu pour inventer un objet.
+const ERASE_REFINE: f32 = 0.45;
+
+/// Image vue avec une pièce posée dessus (lecture seule).
+struct Over<'a, C: Canvas> {
+    base: &'a C,
+    patch: &'a Patch,
+    x0: i32,
+    y0: i32,
+}
+
+impl<C: Canvas> Canvas for Over<'_, C> {
+    fn size(&self) -> (u32, u32) {
+        self.base.size()
+    }
+    fn get(&self, x: i32, y: i32) -> [f32; 3] {
+        let d = self.base.get(x, y);
+        let (px, py) = (x - self.x0, y - self.y0);
+        if px < 0 || py < 0 || px >= self.patch.w as i32 || py >= self.patch.h as i32 {
+            return d;
+        }
+        let q = self.patch.px[(py as u32 * self.patch.w + px as u32) as usize];
+        let a = q[3].clamp(0.0, 1.0);
+        std::array::from_fn(|c| d[c] + (q[c] - d[c]) * a)
+    }
+    fn set(&mut self, _: i32, _: i32, _: [f32; 3]) {}
+}
+
 pub(crate) struct F32Ref<'a> {
     data: &'a [[f32; 4]],
     w: u32,
@@ -541,7 +901,7 @@ pub fn cache_load(f: &Path) -> Option<Patch> {
     let rect = [f32::from_bits(u(4)), f32::from_bits(u(8)), f32::from_bits(u(12)), f32::from_bits(u(16))];
     let (w, h) = (u(20), u(24));
     let data = &b[28..];
-    if data.len() != (w * h * 8) as usize {
+    if data.len() as u64 != w as u64 * h as u64 * 8 {
         return None;
     }
     let halfs: &[u16] = bytemuck::cast_slice(data);
@@ -574,11 +934,45 @@ pub fn compute_patch(img: &impl Canvas, op: &Retouch) -> Result<(Patch, String)>
             let (p, ai) = compute_erase(img, strokes, !smooth)?;
             Ok((p, if *smooth { t!("Gomme appliquée (fond uni).").into() } else if ai { t!("Gomme IA appliquée.").into() } else { t!("Gomme appliquée (texture voisine : modèle IA indisponible).").into() }))
         }
-        Retouch::Generate { strokes, model, prompt, negative, seed, strength } => {
+        Retouch::Generate { strokes, model, prompt, negative, seed, strength, zones } => {
             let set = crate::settings::Settings::load();
             let ollama = set.free_vram.then_some(set.ollama_url.as_str());
-            let translate = set.translate.then_some((set.ollama_url.as_str(), set.translate_model.as_str()));
-            let req = crate::comfy::Request { url: &set.comfy_url, model, prompt, negative, seed: *seed, strength: *strength, inpaint_denoise: None, ollama, translate };
+            // Gomme par diffusion : invite déjà en anglais, rien à traduire.
+            let erase = prompt == crate::comfy::ERASE_PROMPT;
+            let translate = (set.translate && !erase).then_some((set.ollama_url.as_str(), set.translate_model.as_str()));
+            let req = crate::comfy::Request { url: &set.comfy_url, model, prompt, negative, seed: *seed, strength: *strength, inpaint_denoise: None, refine: false, ollama, translate };
+            if erase {
+                // Comme la gomme LaMa : un cadre par groupe d'objets, chacun à la résolution du modèle.
+                let (w, h) = img.size();
+                // LaMa efface d'abord (rien d'inventé), puis la diffusion à mi-force refait la texture
+                // sans dessiner d'objets nouveaux (kiosques, rambardes à pleine force).
+                let refine = crate::comfy::Request { strength: ERASE_REFINE, inpaint_denoise: Some(ERASE_REFINE), refine: true, ..req };
+                // Fichiers de diagnostic gardés pour chaque groupe (groupe-1-envoi.png…), pas seulement le dernier.
+                let debug = crate::library::data_dir().join("generation");
+                if let Ok(rd) = std::fs::read_dir(&debug) {
+                    rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("groupe-")).for_each(|e| {
+                        let _ = std::fs::remove_file(e.path());
+                    });
+                }
+                // Précise : groupes plus petits (les trous entre les blocs de personnes servent de coupures),
+                // traités l'un après l'autre, chacun voyant les précédents déjà effacés.
+                let groups = if *zones { erase_groups_by(strokes, w, h, 0.01) } else { erase_groups(strokes, w, h) };
+                let mut parts: Vec<Patch> = Vec::new();
+                for (i, g) in groups.iter().enumerate() {
+                    let stack = Stack { base: img, parts: &parts };
+                    let p = erase_diffuse(&stack, g, &refine, *zones, &|k| {
+                        for n in ["envoi", "recu", "photo", "piece"] {
+                            let _ = std::fs::copy(debug.join(format!("{n}.png")), debug.join(format!("groupe-{}{k}-{n}.png", i + 1)));
+                        }
+                    })?;
+                    parts.extend(p);
+                }
+                if parts.is_empty() {
+                    anyhow::bail!("aucune zone peinte");
+                }
+                let patch = stack_patches(&parts, w, h);
+                return Ok((patch, if crate::sdlocal::is_local(model) { t!("Gomme (moteur local) appliquée.").into() } else { t!("Gomme ComfyUI appliquée.").into() }));
+            }
             let (patch, translated) = crate::comfy::generate(img, strokes, &req)?;
             Ok((patch, match (translated, crate::sdlocal::is_local(model)) {
                 (Some(t), false) => tf!("Génération ComfyUI appliquée (invite traduite : « {t} »).", t),
@@ -683,6 +1077,166 @@ pub fn apply_to_mask(mask: &mut [f32], w: u32, h: u32, ops: &[Retouch]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn essai_gomme_diffusion() {
+        // Faux moteur local (LUMINUX_SD, LUMINUX_FAKE_MODEL) : deux objets éloignés, deux cadres.
+        let Ok(model) = std::env::var("LUMINUX_FAKE_MODEL") else { return };
+        let (w, h) = (1600u32, 800u32);
+        let mut data = canvas(w, h, |x, _| 0.2 + 0.6 * x as f32 / w as f32);
+        let sq = |x0: f32, y0: f32| BrushStroke { points: vec![[x0, y0], [x0 + 0.04, y0], [x0 + 0.04, y0 + 0.1], [x0, y0 + 0.1]], radius: 0.001, hardness: 0.9, flow: 1.0, erase: false, fill: true };
+        let op = Retouch::Generate { strokes: vec![sq(0.1, 0.5), sq(0.8, 0.6)], model: format!("local:{model}"), prompt: crate::comfy::ERASE_PROMPT.into(), negative: crate::comfy::ERASE_NEGATIVE.into(), seed: 1, strength: 1.0, zones: false };
+        let cv = F32Canvas { data: &mut data, w, h };
+        let (p, msg) = compute_patch(&cv, &op).unwrap();
+        assert!(msg.contains("Gomme"), "{msg}");
+        assert!(p.rect[0] < 0.1 && p.rect[0] + p.rect[2] > 0.84, "{:?}", p.rect);
+        let at = |fx: f32, fy: f32| {
+            let (x, y) = ((fx - p.rect[0]) / p.rect[2] * p.w as f32, (fy - p.rect[1]) / p.rect[3] * p.h as f32);
+            p.px[(y as u32 * p.w + x as u32) as usize][3]
+        };
+        assert!(at(0.12, 0.55) > 0.9 && at(0.82, 0.65) > 0.9 && at(0.45, 0.55) < 0.01);
+    }
+
+    #[test]
+    #[ignore]
+    fn essai_gomme_diffusion_bords() {
+        // Petites zones, collées aux bords et aux coins : aucun plantage.
+        let Ok(model) = std::env::var("LUMINUX_FAKE_MODEL") else { return };
+        let (w, h) = (1200u32, 800u32);
+        let mut data = canvas(w, h, |x, y| ((x ^ y) % 7) as f32 / 7.0);
+        let sq = |x0: f32, y0: f32, s: f32| BrushStroke { points: vec![[x0, y0], [x0 + s, y0], [x0 + s, y0 + s], [x0, y0 + s]], radius: 0.0005, hardness: 0.9, flow: 1.0, erase: false, fill: true };
+        let cases = vec![
+            vec![sq(0.0, 0.0, 0.01)],
+            vec![sq(0.99, 0.99, 0.01)],
+            vec![sq(0.0, 0.5, 0.002), sq(0.5, 0.0, 0.002), sq(0.998, 0.3, 0.002)],
+            vec![sq(0.0, 0.0, 1.0)],
+            vec![sq(0.3, 0.3, 0.0005)],
+        ];
+        let cv = F32Canvas { data: &mut data, w, h };
+        for (k, st) in cases.into_iter().enumerate() {
+            let op = Retouch::Generate { strokes: st, model: format!("local:{model}"), prompt: crate::comfy::ERASE_PROMPT.into(), negative: String::new(), seed: 1, strength: 1.0, zones: false };
+            match compute_patch(&cv, &op) {
+                Ok((p, _)) => assert_eq!(p.px.len(), (p.w * p.h) as usize, "cas {k}"),
+                Err(e) => eprintln!("cas {k} : {e:#}"),
+            }
+        }
+    }
+
+    #[test]
+    fn stroke_outside_the_photo_is_ignored() {
+        // Trait passé dans la marge à gauche de la photo : il formait un groupe au cadre inversé
+        // (largeur négative lue comme 4 milliards de pixels) et l'appli s'arrêtait faute de mémoire.
+        let (w, h) = (600u32, 300u32);
+        let out = BrushStroke { points: vec![[-0.5, 0.5], [-0.45, 0.6]], radius: 0.01, hardness: 0.9, flow: 1.0, erase: false, fill: false };
+        let inside = BrushStroke { points: vec![[0.5, 0.5]], ..out.clone() };
+        assert!(erase_area(std::slice::from_ref(&out), w, h).is_none());
+        let g = erase_groups(&[out.clone(), inside], w, h);
+        assert_eq!(g.len(), 1);
+        let mut data = canvas(w, h, |_, _| 0.5);
+        let cv = F32Canvas { data: &mut data, w, h };
+        assert!(compute_erase(&cv, &[out], false).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn essai_gomme_diffusion_zones() {
+        // Faux moteur : une longue foule (bande de 2400 px), un piéton isolé à droite. Passe précise :
+        // la bande est découpée en tranches, le piéton a son propre cadre, tout est effacé.
+        let Ok(model) = std::env::var("LUMINUX_FAKE_MODEL") else { return };
+        let (w, h) = (3200u32, 1200u32);
+        let mut mask = vec![0f32; (w * h) as usize];
+        for y in 500..800 {
+            for x in 200..2600 {
+                mask[(y * w + x) as usize] = 1.0;
+            }
+            for x in 2900..2980 {
+                mask[(y * w + x) as usize] = 1.0;
+            }
+        }
+        let strokes = selection_from_mask(&mask, w, h, false, 3);
+        let mut data = canvas(w, h, |x, _| 0.2 + 0.6 * x as f32 / w as f32);
+        for y in 500..800 {
+            for x in (200..2600).chain(2900..2980) {
+                data[(y * w + x) as usize] = [0.0, 0.0, 0.0, 1.0];
+            }
+        }
+        for zones in [false, true] {
+            let op = Retouch::Generate { strokes: strokes.clone(), model: format!("local:{model}"), prompt: crate::comfy::ERASE_PROMPT.into(), negative: String::new(), seed: 1, strength: 1.0, zones };
+            let cv = F32Canvas { data: &mut data, w, h };
+            let (p, _) = compute_patch(&cv, &op).unwrap();
+            let at = |fx: f32, fy: f32| {
+                let (x, y) = ((fx - p.rect[0]) / p.rect[2] * p.w as f32, (fy - p.rect[1]) / p.rect[3] * p.h as f32);
+                p.px[(y as u32 * p.w + x as u32) as usize]
+            };
+            for fx in [0.1, 0.3, 0.5, 0.7, 0.92] {
+                let q = at(fx, 0.54);
+                let want = 0.2 + 0.6 * fx;
+                // Le faux moteur pose un carré rouge (objet inventé) : seul le gris doit suivre le dégradé.
+                if q[1] < 0.05 && q[0] > 0.2 {
+                    continue;
+                }
+                assert!(q[3] > 0.95 && (q[0] - want).abs() < 0.15, "zones {zones} x {fx} : {q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn distant_objects_are_erased_separately() {
+        let (w, h) = (600u32, 300u32);
+        let sq = |x0: f32, y0: f32| BrushStroke { points: vec![[x0, y0], [x0 + 0.05, y0], [x0 + 0.05, y0 + 0.1], [x0, y0 + 0.1]], radius: 0.001, hardness: 0.9, flow: 1.0, erase: false, fill: true };
+        let strokes = vec![sq(0.1, 0.4), sq(0.12, 0.45), sq(0.8, 0.5)];
+        let g = erase_groups(&strokes, w, h);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g.iter().map(|g| g.len()).sum::<usize>(), 3);
+        // Fond en dégradé, deux taches sombres : la pièce couvre les deux et les efface.
+        let mut data = canvas(w, h, |x, _| 0.2 + 0.6 * x as f32 / w as f32);
+        for (x, y) in [(70u32, 135u32), (500, 165)] {
+            for dy in 0..10 {
+                for dx in 0..10 {
+                    data[((y + dy) * w + x + dx) as usize] = [0.0, 0.0, 0.0, 1.0];
+                }
+            }
+        }
+        let cv = F32Canvas { data: &mut data, w, h };
+        let (p, _) = compute_erase(&cv, &strokes, false).unwrap();
+        let at = |fx: u32, fy: u32| {
+            let (ox, oy) = ((p.rect[0] * w as f32).round() as u32, (p.rect[1] * h as f32).round() as u32);
+            p.px[((fy - oy) * p.w + fx - ox) as usize]
+        };
+        for (x, y) in [(75u32, 140u32), (505, 170)] {
+            let q = at(x, y);
+            let want = 0.2 + 0.6 * x as f32 / w as f32;
+            assert!(q[3] > 0.9 && (q[0] - want).abs() < 0.08, "({x}, {y}) : {q:?}");
+        }
+        // Entre les deux objets, la pièce est transparente.
+        assert!(at(300, 150)[3] < 0.01);
+    }
+
+    #[test]
+    fn mask_becomes_selection() {
+        // Deux silhouettes dans une photo en hauteur ; la sélection doit les couvrir et rester près d'elles.
+        let (w, h) = (400u32, 900u32);
+        let inside = |x: u32, y: u32| ((100..140).contains(&x) && (500..700).contains(&y)) || ((x as f32 - 300.0).powi(2) + (y as f32 - 300.0).powi(2) < 900.0);
+        let data: Vec<f32> = (0..w * h).map(|i| if inside(i % w, i / w) { 1.0 } else { 0.0 }).collect();
+        let strokes = selection_from_mask(&data, w, h, false, 0);
+        assert!(!strokes.is_empty() && strokes.len() < 200, "{}", strokes.len());
+        let mut sel = vec![0f32; (w * h) as usize];
+        crate::masks::paint_strokes(&mut sel, w, h, &strokes);
+        let missed = (0..w * h).filter(|&i| inside(i % w, i / w) && sel[i as usize] < 0.5).count();
+        assert_eq!(missed, 0);
+        // Rien de sélectionné loin des objets (au-delà de deux cases).
+        assert!(sel[(100 * w + 50) as usize] < 0.5 && sel[(800 * w + 300) as usize] < 0.5);
+        let extra = sel.iter().filter(|v| **v > 0.5).count() as f32 / data.iter().filter(|v| **v > 0.5).count() as f32;
+        assert!(extra < 2.0, "{extra}");
+        // En mode Retirer, les rectangles enlèvent.
+        assert!(selection_from_mask(&data, w, h, true, 0).iter().all(|s| s.erase && s.fill));
+        // Ombre : avec `down`, la sélection descend sous les pieds, pas au-dessus de la tête.
+        let mut low = vec![0f32; (w * h) as usize];
+        crate::masks::paint_strokes(&mut low, w, h, &selection_from_mask(&data, w, h, false, 3));
+        assert!(low[(712 * w + 120) as usize] > 0.5 && sel[(712 * w + 120) as usize] < 0.5);
+        assert!(low[(488 * w + 120) as usize] < 0.5);
+    }
 
     fn canvas(w: u32, h: u32, f: impl Fn(u32, u32) -> f32) -> Vec<[f32; 4]> {
         (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| {

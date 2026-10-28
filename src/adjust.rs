@@ -303,7 +303,17 @@ pub enum Retouch {
     /// `smooth` : remplissage rapide par le fond environnant, sans l'IA (LaMa).
     Erase { strokes: Vec<BrushStroke>, #[serde(default)] smooth: bool },
     /// Génération ComfyUI dans la zone peinte : modèle (checkpoint), invite, graine, force (denoise).
-    Generate { strokes: Vec<BrushStroke>, model: String, prompt: String, negative: String, seed: u64, strength: f32 },
+    Generate {
+        strokes: Vec<BrushStroke>,
+        model: String,
+        prompt: String,
+        negative: String,
+        seed: u64,
+        strength: f32,
+        /// Gomme par diffusion, passe précise : objets longs découpés en tranches.
+        #[serde(default)]
+        zones: bool,
+    },
 }
 
 /// Correction d'objectif (base Lensfun).

@@ -3,6 +3,127 @@
 Toutes les versions de Luminux IA, de la plus récente à la plus ancienne. Chaque release GitHub
 reprend la section de sa version.
 
+## [0.33.1] - 2026-10-22
+
+- Gomme ComfyUI : la repasse ne présente plus au modèle un trou gris à combler (qui l'invitait à
+  dessiner des silhouettes blanches, des rambardes, des rectangles plus clairs). Il voit l'image
+  effacée par LaMa en entier et ne retouche que la texture de la zone, à force 0,45 au lieu de 0,55.
+
+## [0.33.0] - 2026-10-22
+
+- Gomme ComfyUI : choix de passe « Rapide » ou « Précise ». En précise, les blocs de personnes
+  séparés par un espace sont traités chacun à part, et une longue foule est découpée en 2 ou 3
+  tranches traitées près de la résolution du modèle (moins de flou, moins d'objets inventés).
+  Plus lent : 2 à 3 fois plus de passages.
+- Gomme ComfyUI : les groupes d'objets sont traités l'un après l'autre, chacun voyant les
+  précédents déjà effacés (les personnes voisines ne déteignent plus dans le remplissage).
+
+## [0.32.2] - 2026-10-22
+
+- Gomme ComfyUI : le moteur repasse sur la sortie LaMa brute, sans les morceaux de photo recopiés
+  (un pan de kiosque recopié devenait un mur inventé sous les parasols).
+- Gomme ComfyUI : un objet entièrement couvert par des traits « Retirer » n'est plus envoyé au moteur.
+- Diagnostic : les images envoyées et reçues sont gardées pour chaque objet effacé
+  (groupe-1-envoi.png, groupe-2-envoi.png…), plus seulement pour le dernier.
+
+## [0.32.1] - 2026-10-22
+
+- Correction d'un arrêt brutal (« memory allocation failed ») avec la gomme ComfyUI : un trait de
+  pinceau passé hors de la photo formait un cadre inversé. Ces traits sont maintenant ignorés. L'appli
+  qui se fermait au lancement en rouvrant la photo redémarre normalement.
+- Gomme ComfyUI : LaMa efface d'abord, puis le moteur de Générer repasse à mi-force. Plus d'objets
+  inventés (kiosques, rambardes), seulement une texture plus naturelle.
+- Gomme : boutons de remplissage raccourcis (« LaMa », « ComfyUI », « Fond uni ») pour ne plus
+  déborder du panneau.
+
+## [0.32.0] - 2026-10-22
+
+- Gomme : troisième remplissage « ComfyUI (meilleur) » (ou « SD local » en moteur local). Le moteur
+  de Générer invente le fond au lieu d'étirer les alentours, avec une invite d'effacement automatique
+  et « personne, objet… » à éviter. Un cadre par groupe d'objets, comme pour LaMa. Plus lent.
+
+## [0.31.2] - 2026-10-22
+
+- Gomme IA : des objets éloignés les uns des autres (passants dispersés) sont effacés chacun dans son
+  propre cadre, à pleine définition, au lieu d'un seul grand cadre réduit à 512 px qui laissait des
+  traînées floues.
+- « Depuis l'IA » : la sélection Personnes descend un peu sous les pieds pour emporter l'ombre au sol
+  (un peu aussi pour Sujet).
+
+## [0.31.1] - 2026-10-22
+
+- Retouche, ligne « Depuis l'IA » : les masques posés dans la sélection restent en surbrillance, et
+  un second clic sur un bouton allumé retire sa sélection (plus besoin de « Recommencer »).
+- Masques : les boutons « + » des réglages déjà ajoutés sont en surbrillance.
+
+## [0.31.0] - 2026-10-22
+
+- Gomme IA et Générer : ligne « Depuis l'IA » (Sujet, Personnes, Bâtiments, Végétation, Ciel) qui
+  sélectionne d'un clic ce que l'IA détecte. Le masque est calculé au besoin, puis posé en sélection,
+  ajoutée ou retirée selon l'action choisie, et corrigeable au pinceau.
+
+## [0.30.0] - 2026-10-22
+
+- Masques : la section explique son principe dès l'ouverture, et les boutons sont rangés en deux
+  groupes, « Dessiner la zone » et « Détecter la zone (IA) ».
+- Masques : « Ajouter / Retirer » remplace le bouton Gomme et Alt pour corriger un masque peint ou
+  détecté ; la taille du pinceau s'affiche en % de la photo et en pixels (elle affichait 0.00).
+- Masques : bouton « ↺ Réinitialiser » qui remet l'opacité et les curseurs d'un réglage à zéro.
+- Masques de scène (personnes, bâtiments, végétation…) : calcul par tuiles sur la photo à un petit
+  côté de 1024 px, au lieu de l'image entière écrasée en 512 × 512. Les personnes lointaines
+  devraient être trouvées (modèle non testé ici sur une vraie photo).
+- Export PNG et TIFF : choix 8 bits (par défaut, fichier deux fois plus léger) ou 16 bits.
+
+## [0.29.5] - 2026-10-21
+
+- Générer : une zone collée au bord de la photo ne laisse plus de bande claire ou teintée le long de ce
+  bord. Le modèle en produit au bord de l'image qu'il génère ; une marge en miroir est ajoutée de ce
+  côté avant l'envoi puis retirée au retour.
+
+## [0.29.4] - 2026-10-21
+
+- Générer : la dernière génération est gardée pour diagnostic dans le dossier de données de Luminux,
+  sous-dossier « generation » (image envoyée, image reçue, photo d'origine, pièce posée), écrasée à
+  chaque génération.
+
+## [0.29.3] - 2026-10-21
+
+- Générer, « À éviter » : termes courants en boutons à cocher (Flou, Déformé, Basse définition, Texte,
+  Filigrane, Fond blanc, Halo, Cadre, Dessin, Mains ratées), libellés traduits dans la langue de
+  l'interface ; ils ajoutent ou retirent les termes anglais dans le texte libre, qui reste modifiable.
+- Invite négative par défaut : « white background, halo, glow » ajoutés (le halo blanc autour des objets
+  générés disparaît avec eux, essai réel du 2026-10-21).
+
+## [0.29.2] - 2026-10-21
+
+- Moteur local : stable-diffusion.cpp passe de master-920 à master-987 (dernière version, 21/10/2026).
+  Luminux propose de télécharger le nouveau moteur (35 Mo) et supprime l'ancien. Options utilisées
+  vérifiées dans l'aide du nouveau programme.
+
+## [0.29.1] - 2026-10-21
+
+- Générer : le léger carré encore visible autour de la zone générée est atténué. Le raccord des teintes se
+  fait avant l'agrandissement du résultat (l'agrandissement d'un saut de teinte laissait un liseré), le
+  fondu du bord mêle la photo d'origine et non sa copie repassée par le modèle, et le grain de la photo est
+  ajouté dans la zone, plus lisse sinon.
+
+## [0.29.0] - 2026-10-21
+
+- Moteur local : choix du modèle de génération par boutons, SD 1.5 (léger, 2,1 Go) ou SDXL inpainting
+  (meilleur, 6,9 Go, 8 Go de mémoire vidéo conseillés), téléchargeable depuis les Préférences. Avec SDXL,
+  le texte est encodé par le processeur et l'image décodée par tuiles pour tenir en mémoire vidéo.
+
+## [0.28.5] - 2026-10-21
+
+- Générer : le raccord des teintes de la 0.28.3 ne corrigeait rien quand le modèle gardait le contexte et
+  n'éclaircissait que la zone (cas réel). L'écart est maintenant mesuré de part et d'autre du bord de la
+  zone ; vérifié avec un moteur simulé (fond éclairci et objet rouge : fond raccordé, objet conservé).
+
+## [0.28.4] - 2026-10-21
+
+- Correcteur : seuls les repères de la dernière tache et de celle survolée restent affichés, et seulement
+  quand le Correcteur est actif ; l'aide explique le cercle pointillé (zone copiée).
+
 ## [0.28.3] - 2026-10-21
 
 - Générer : la teinte du fond de la zone générée est raccordée à celle de la photo autour (fini le carré

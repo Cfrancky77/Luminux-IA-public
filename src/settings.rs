@@ -68,7 +68,7 @@ impl Default for Settings {
             batch_format: "jpg".into(),
             comfy_url: crate::comfy::DEFAULT_URL.into(),
             comfy_model: String::new(),
-            comfy_negative: "blurry, deformed, lowres, text, watermark".into(),
+            comfy_negative: "blurry, deformed, lowres, text, watermark, white background, halo, glow".into(),
             free_vram: false,
             translate: true,
             translate_model: String::new(),

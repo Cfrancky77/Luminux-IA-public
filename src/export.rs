@@ -40,11 +40,14 @@ pub struct Options {
     pub author: String,
     pub copyright: String,
     pub watermark: crate::watermark::Watermark,
+    /// PNG et TIFF en 16 bits par couche (sinon 8) : utile pour un RAW ou une retouche ailleurs,
+    /// mais le fichier pèse le double.
+    pub deep: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { space: Space::Srgb, long_edge: 0, sharpen: Sharpen::None, quality: 92, metadata: true, gps: true, author: String::new(), copyright: String::new(), watermark: Default::default() }
+        Self { space: Space::Srgb, long_edge: 0, sharpen: Sharpen::None, quality: 92, metadata: true, gps: true, author: String::new(), copyright: String::new(), watermark: Default::default(), deep: false }
     }
 }
 
@@ -349,7 +352,7 @@ fn raw_fields(src: &Path) -> Vec<exif::Field> {
 }
 
 /// Écrit l'image développée (RGB encodé sRGB, 0..1) selon les options ; `src` : photo d'origine (EXIF).
-/// Le format suit l'extension : JPEG 8 bits, PNG et TIFF 16 bits.
+/// Le format suit l'extension : JPEG, WebP et AVIF 8 bits, PNG et TIFF 8 ou 16 bits (`deep`).
 pub fn write(out: &Path, src: Option<&Path>, width: u32, height: u32, rgba: &[[f32; 4]], opts: &Options) -> Result<()> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "tif" | "tiff" | "webp" | "avif") {
@@ -376,13 +379,13 @@ pub fn write(out: &Path, src: Option<&Path>, width: u32, height: u32, rgba: &[[f
             enc.write_image(&data, w, h, image::ExtendedColorType::Rgb8)?;
         }
         "png" => {
-            let data: Vec<u8> = rgb.iter().flat_map(|v| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_ne_bytes()).collect();
+            let (data, ty) = samples(&rgb, opts.deep);
             let mut enc = image::codecs::png::PngEncoder::new(file);
             let _ = enc.set_icc_profile(icc);
             if let Some(x) = exif {
                 let _ = enc.set_exif_metadata(x);
             }
-            enc.write_image(&data, w, h, image::ExtendedColorType::Rgb16)?;
+            enc.write_image(&data, w, h, ty)?;
         }
         "webp" => {
             let data: Vec<u8> = rgb.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
@@ -400,13 +403,22 @@ pub fn write(out: &Path, src: Option<&Path>, width: u32, height: u32, rgba: &[[f
         }
         _ => {
             // TIFF : profil ICC intégré ; l'encodeur d'image ne sait pas écrire les EXIF.
-            let data: Vec<u8> = rgb.iter().flat_map(|v| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_ne_bytes()).collect();
+            let (data, ty) = samples(&rgb, opts.deep);
             let mut enc = image::codecs::tiff::TiffEncoder::new(file);
             let _ = enc.set_icc_profile(icc);
-            enc.write_image(&data, w, h, image::ExtendedColorType::Rgb16)?;
+            enc.write_image(&data, w, h, ty)?;
         }
     }
     Ok(())
+}
+
+/// Valeurs 0..1 en octets de 8 ou 16 bits par couche, avec le type d'image à écrire.
+fn samples(rgb: &[f32], deep: bool) -> (Vec<u8>, image::ExtendedColorType) {
+    if deep {
+        (rgb.iter().flat_map(|v| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_ne_bytes()).collect(), image::ExtendedColorType::Rgb16)
+    } else {
+        (rgb.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect(), image::ExtendedColorType::Rgb8)
+    }
 }
 
 /// Fichier WebP étendu (VP8X) : profil ICC, image de libwebp, EXIF. libwebp seul n'écrit que l'image.
@@ -518,10 +530,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("t.png");
         let px = vec![[0.2f32, 0.5, 0.8, 1.0]; 4];
+        write(&out, None, 2, 2, &px, &Options { deep: true, ..Default::default() }).unwrap();
+        let img = image::open(&out).unwrap();
+        assert_eq!(img.color(), image::ColorType::Rgb16);
+        assert_eq!(img.to_rgb16().get_pixel(1, 1).0, [13107, 32768, 52428]);
+        // Par défaut : 8 bits, fichier deux fois plus léger.
         write(&out, None, 2, 2, &px, &Options::default()).unwrap();
-        let img = image::open(&out).unwrap().to_rgb16();
-        let p = img.get_pixel(1, 1).0;
-        assert_eq!(p, [13107, 32768, 52428]);
+        let img = image::open(&out).unwrap();
+        assert_eq!(img.color(), image::ColorType::Rgb8);
+        assert_eq!(img.to_rgb8().get_pixel(1, 1).0, [51, 128, 204]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

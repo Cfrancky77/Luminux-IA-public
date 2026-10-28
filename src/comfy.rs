@@ -241,6 +241,9 @@ pub struct Request<'a> {
     pub strength: f32,
     /// Denoise imposé aux modèles d'inpainting (None : 1,0, la zone est entièrement recréée).
     pub inpaint_denoise: Option<f32>,
+    /// Repasse sur une zone déjà remplie (gomme : sortie LaMa) : le modèle voit l'image entière, sans
+    /// trou gris à combler (qui l'invitait à dessiner des objets), et le bruit reste limité au masque.
+    pub refine: bool,
     /// Serveur Ollama à vider avant la génération (None : ne rien décharger).
     pub ollama: Option<&'a str>,
     /// Traduction de l'invite : serveur Ollama et modèle (vide : choix automatique).
@@ -257,20 +260,27 @@ fn denoise(req: &Request, rc: &Recipe) -> f32 {
 /// au masque). Essai réel du 2026-10-20 avec VAEEncodeForInpaint : bords ajoutés remplis d'un aplat gris.
 fn graph(req: &Request, image: &str, rc: &Recipe) -> Value {
     let denoise = denoise(req, rc);
-    json!({
+    let mut g = json!({
         "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": req.model}},
         "2": {"class_type": "LoadImage", "inputs": {"image": image}},
         "3": {"class_type": "CLIPTextEncode", "inputs": {"text": req.prompt, "clip": ["1", 1]}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": req.negative, "clip": ["1", 1]}},
         "6": {"class_type": "InpaintModelConditioning", "inputs": {
-            "positive": ["3", 0], "negative": ["4", 0], "vae": ["1", 2], "pixels": ["2", 0], "mask": ["2", 1], "noise_mask": true}},
+            "positive": ["3", 0], "negative": ["4", 0], "vae": ["1", 2], "pixels": ["2", 0],
+            "mask": if req.refine { json!(["10", 0]) } else { json!(["2", 1]) }, "noise_mask": !req.refine}},
         "7": {"class_type": "KSampler", "inputs": {
-            "model": ["1", 0], "positive": ["6", 0], "negative": ["6", 1], "latent_image": ["6", 2],
+            "model": ["1", 0], "positive": ["6", 0], "negative": ["6", 1], "latent_image": if req.refine { json!(["11", 0]) } else { json!(["6", 2]) },
             "seed": req.seed, "steps": rc.steps, "cfg": rc.cfg, "sampler_name": rc.sampler,
             "scheduler": rc.scheduler, "denoise": denoise}},
         "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
         "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": "luminux"}}
-    })
+    });
+    if req.refine {
+        // Repasse : masque vide pour le conditionnement (masque > 1 : nul partout), vrai masque pour le bruit.
+        g["10"] = json!({"class_type": "ThresholdMask", "inputs": {"mask": ["2", 1], "value": 1.0}});
+        g["11"] = json!({"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["6", 2], "mask": ["2", 1]}});
+    }
+    g
 }
 
 fn upload(agent: &ureq::Agent, url: &str, name: &str, png: &[u8]) -> Result<String> {
@@ -411,7 +421,7 @@ pub fn upscale(url: &str, img: &image::RgbImage, model: &str, factor: f32, ollam
         bail!("image finale trop grande ({tw} × {th}) : {} Mpx au plus", UPSCALE_MAX_PX / 1_000_000);
     }
     let ms = model_scale(model) as f32;
-    let req = Request { url, model, prompt: "", negative: "", seed: 0, strength: 1.0, inpaint_denoise: None, ollama, translate: None };
+    let req = Request { url, model, prompt: "", negative: "", seed: 0, strength: 1.0, inpaint_denoise: None, refine: false, ollama, translate: None };
     const TILE: u32 = 1024;
     const MARGIN: u32 = 16;
     let (xs, ys) = (tile_spans(w, TILE), tile_spans(h, TILE));
@@ -524,26 +534,63 @@ pub fn expand(img: &image::RgbImage, margins: [u32; 4], req: &Request) -> Result
     Ok((out, translated))
 }
 
-/// Raccord des teintes : le modèle rend souvent la zone plus claire ou plus terne que la photo (carré
-/// visible, essai réel du 2026-10-21 en local). L'écart photo − résultat, mesuré autour de la zone, est
-/// prolongé en douceur à l'intérieur (équation de Laplace sur une grille réduite) puis ajouté au résultat.
+/// Raccord des teintes : le modèle rend souvent l'intérieur de la zone plus clair ou plus terne que la
+/// photo (carré visible, essais réels du 2026-10-21 en local et sous ComfyUI). On mesure l'écart entre la
+/// photo juste autour de la zone et le résultat juste à l'intérieur de son bord, puis on le prolonge en
+/// douceur vers le centre (équation de Laplace sur une grille réduite) et on l'ajoute au résultat :
+/// les objets générés gardent leurs couleurs, seul le fond est ramené à la teinte de la photo.
 fn match_context(out: &mut image::RgbImage, orig: &image::RgbaImage, hole: &[f32]) {
     let (w, h) = out.dimensions();
     let g = 96.0 / w.max(h) as f32;
     let (gw, gh) = (((w as f32 * g).ceil() as usize).max(2), ((h as f32 * g).ceil() as usize).max(2));
-    let mut sum = vec![[0.0f32; 3]; gw * gh];
-    let mut n = vec![0u32; gw * gh];
+    // Bandes de part et d'autre du bord, un peu plus larges qu'une case de la grille.
+    let band = ((1.5 / g).ceil() as usize).max(2);
+    let inside: Vec<f32> = hole.iter().map(|v| if *v > 0.5 { 1.0 } else { 0.0 }).collect();
+    let outside: Vec<f32> = inside.iter().map(|v| 1.0 - v).collect();
+    let near_in = dilate(&outside, w, h, band);
+    let near_out = dilate(&inside, w, h, band);
+    let mut sum_o = vec![[0.0f32; 3]; gw * gh];
+    let mut sum_g = vec![[0.0f32; 3]; gw * gh];
+    let (mut n_o, mut n_g) = (vec![0u32; gw * gh], vec![0u32; gw * gh]);
     for y in 0..h {
         for x in 0..w {
-            if hole[(y * w + x) as usize] > 0.5 {
+            let i = (y * w + x) as usize;
+            let c = ((y as f32 * g) as usize).min(gh - 1) * gw + ((x as f32 * g) as usize).min(gw - 1);
+            if inside[i] < 0.5 && near_out[i] > 0.5 {
+                let a = orig.get_pixel(x, y);
+                (0..3).for_each(|k| sum_o[c][k] += a[k] as f32);
+                n_o[c] += 1;
+            } else if inside[i] > 0.5 && near_in[i] > 0.5 {
+                let b = out.get_pixel(x, y);
+                (0..3).for_each(|k| sum_g[c][k] += b[k] as f32);
+                n_g[c] += 1;
+            }
+        }
+    }
+    // Case du bord : écart moyen photo (dehors) − résultat (dedans) ; une case voisine complète un côté manquant.
+    let side = |sum: &[[f32; 3]], n: &[u32], x: usize, y: usize| -> Option<[f32; 3]> {
+        let (mut acc, mut k) = ([0.0f32; 3], 0u32);
+        for yy in y.saturating_sub(1)..=(y + 1).min(gh - 1) {
+            for xx in x.saturating_sub(1)..=(x + 1).min(gw - 1) {
+                let j = yy * gw + xx;
+                (0..3).for_each(|c| acc[c] += sum[j][c]);
+                k += n[j];
+            }
+        }
+        (k > 0).then(|| acc.map(|v| v / k as f32))
+    };
+    let mut n = vec![0u32; gw * gh];
+    let mut sum = vec![[0.0f32; 3]; gw * gh];
+    for y in 0..gh {
+        for x in 0..gw {
+            let i = y * gw + x;
+            if n_o[i] == 0 && n_g[i] == 0 {
                 continue;
             }
-            let c = ((y as f32 * g) as usize).min(gh - 1) * gw + ((x as f32 * g) as usize).min(gw - 1);
-            let (a, b) = (orig.get_pixel(x, y), out.get_pixel(x, y));
-            for k in 0..3 {
-                sum[c][k] += a[k] as f32 - b[k] as f32;
+            if let (Some(o), Some(r)) = (side(&sum_o, &n_o, x, y), side(&sum_g, &n_g, x, y)) {
+                sum[i] = [o[0] - r[0], o[1] - r[1], o[2] - r[2]];
+                n[i] = 1;
             }
-            n[c] += 1;
         }
     }
     let known: Vec<bool> = n.iter().map(|&k| k > 0).collect();
@@ -601,6 +648,105 @@ fn match_context(out: &mut image::RgbImage, orig: &image::RgbaImage, hole: &[f32
     }
 }
 
+/// Grain : le résultat agrandi est plus lisse que la photo (carré visible sur un ciel). On mesure le grain
+/// (écart à la moyenne 3×3) autour de la zone et dans la zone, et on ajoute dans la zone le bruit qui manque.
+fn match_grain(out: &mut image::RgbImage, orig: &image::RgbaImage, hole: &[f32], seed: u64) {
+    let (w, h) = out.dimensions();
+    let hp = |img: &dyn Fn(u32, u32) -> [f32; 3], x: u32, y: u32| -> [f32; 3] {
+        let mut m = [0.0f32; 3];
+        for yy in y - 1..=y + 1 {
+            for xx in x - 1..=x + 1 {
+                let p = img(xx, yy);
+                (0..3).for_each(|k| m[k] += p[k] / 9.0);
+            }
+        }
+        let p = img(x, y);
+        [p[0] - m[0], p[1] - m[1], p[2] - m[2]]
+    };
+    let po = |x: u32, y: u32| { let p = orig.get_pixel(x, y); [p[0] as f32, p[1] as f32, p[2] as f32] };
+    let (mut so, mut no, mut sg, mut ng) = ([0.0f64; 3], 0.0f64, [0.0f64; 3], 0.0f64);
+    {
+        let pg = |x: u32, y: u32| { let p = out.get_pixel(x, y); [p[0] as f32, p[1] as f32, p[2] as f32] };
+        for y in (1..h.saturating_sub(1)).step_by(2) {
+            for x in (1..w.saturating_sub(1)).step_by(2) {
+                if hole[(y * w + x) as usize] > 0.5 {
+                    let d = hp(&pg, x, y);
+                    (0..3).for_each(|k| sg[k] += (d[k] * d[k]) as f64);
+                    ng += 1.0;
+                } else {
+                    let d = hp(&po, x, y);
+                    (0..3).for_each(|k| so[k] += (d[k] * d[k]) as f64);
+                    no += 1.0;
+                }
+            }
+        }
+    }
+    if no < 100.0 || ng < 100.0 {
+        return;
+    }
+    // Écart type du bruit à ajouter (le passe-haut 3×3 garde 8/9 de la variance d'un bruit blanc).
+    let add: Vec<f32> = (0..3).map(|k| ((so[k] / no - sg[k] / ng).max(0.0) * 9.0 / 8.0).sqrt().min(12.0) as f32).collect();
+    if add.iter().all(|v| *v < 0.3) {
+        return;
+    }
+    let mut st = seed | 1;
+    let mut gauss = || {
+        // Somme de 4 uniformes : approximation gaussienne suffisante pour un grain.
+        let mut s = 0.0f32;
+        for _ in 0..4 {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            s += (st >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
+        }
+        s * 1.732
+    };
+    for y in 0..h {
+        for x in 0..w {
+            if hole[(y * w + x) as usize] < 0.5 {
+                continue;
+            }
+            // Grain de luminance commun aux trois couches, comme celui d'un capteur.
+            let n = gauss();
+            let p = out.get_pixel_mut(x, y);
+            for k in 0..3 {
+                p[k] = (p[k] as f32 + n * add[k]).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// Marges (gauche, haut, droite, bas) à ajouter aux côtés où la zone à générer touche le bord.
+fn edge_pads(hole: &[f32], w: u32, h: u32) -> [u32; 4] {
+    let at = |x: u32, y: u32| hole[(y * w + x) as usize] > 0.5;
+    let m = ((w.max(h) as f32 * 0.08).ceil() as u32).max(8);
+    [
+        if (0..h).any(|y| at(0, y)) { m.min(w) } else { 0 },
+        if (0..w).any(|x| at(x, 0)) { m.min(h) } else { 0 },
+        if (0..h).any(|y| at(w - 1, y)) { m.min(w) } else { 0 },
+        if (0..w).any(|x| at(x, h - 1)) { m.min(h) } else { 0 },
+    ]
+}
+
+/// Image agrandie de `pads` (gauche, haut, droite, bas) par symétrie, alpha compris.
+fn mirror_pad(img: &image::RgbaImage, pads: [u32; 4]) -> image::RgbaImage {
+    let (w, h) = img.dimensions();
+    let refl = |v: i64, n: u32| -> u32 {
+        let n = n as i64;
+        let p = (2 * n - 1).max(1);
+        let v = v.rem_euclid(2 * n).min(p);
+        (if v < n { v } else { p - v }) as u32
+    };
+    image::RgbaImage::from_fn(w + pads[0] + pads[2], h + pads[1] + pads[3], |x, y| {
+        *img.get_pixel(refl(x as i64 - pads[0] as i64, w), refl(y as i64 - pads[1] as i64, h))
+    })
+}
+
+/// Invite de la gomme par diffusion : prolonger le décor, rien de nouveau.
+pub const ERASE_PROMPT: &str = "empty background, seamless continuation of the surrounding scene, same texture and lighting";
+/// Ce que la gomme par diffusion ne doit pas dessiner à la place de l'objet effacé.
+pub const ERASE_NEGATIVE: &str = "person, people, figure, crowd, animal, object, text, shadow of a person";
+
 /// Génère le contenu de la zone peinte et renvoie la pièce à poser sur la photo,
 /// avec l'invite traduite si elle l'a été.
 pub fn generate(img: &impl Canvas, strokes: &[BrushStroke], req: &Request) -> Result<(Patch, Option<String>)> {
@@ -612,28 +758,56 @@ pub fn generate(img: &impl Canvas, strokes: &[BrushStroke], req: &Request) -> Re
     let (rw, rh) = ((r[2] - r[0]) as u32, (r[3] - r[1]) as u32);
     let hole: Vec<f32> = dilate(&mask, rw, rh, ((rw.max(rh) as f32 / 200.0).ceil() as usize).max(2)).iter().map(|v| if *v > 0.05 { 1.0 } else { 0.0 }).collect();
     let rc = recipe(req.model);
-    // Taille d'envoi : grand côté à la résolution native du modèle, multiple de 8.
-    let s = rc.side as f32 / rw.max(rh) as f32;
-    let (tw, th) = (((rw as f32 * s / 8.0).round() as u32).max(1) * 8, ((rh as f32 * s / 8.0).round() as u32).max(1) * 8);
     let crop = image::RgbaImage::from_fn(rw, rh, |x, y| {
         let v = img.get(r[0] + x as i32, r[1] + y as i32);
         let a = if hole[(y * rw + x) as usize] > 0.5 { 0 } else { 255 };
         let c = v.map(|c| (to_srgb(c) * 255.0 + 0.5) as u8);
         image::Rgba([c[0], c[1], c[2], a])
     });
+    // Zone collée au bord de la photo : le modèle y laisse une bande claire ou teintée (bord de l'image
+    // générée). On ajoute une marge en miroir de ce côté, retirée au retour, pour que la bande y tombe.
+    let pads = edge_pads(&hole, rw, rh);
+    let sent = mirror_pad(&crop, pads);
+    let (sw, sh) = sent.dimensions();
+    // Taille d'envoi : grand côté à la résolution native du modèle, multiple de 8.
+    let s = rc.side as f32 / sw.max(sh) as f32;
+    let (tw, th) = (((sw as f32 * s / 8.0).round() as u32).max(1) * 8, ((sh as f32 * s / 8.0).round() as u32).max(1) * 8);
     // L'alpha est réduit à part, au plus proche, pour garder un masque net.
-    let mut small = image::imageops::resize(&crop, tw, th, image::imageops::FilterType::CatmullRom);
-    let alpha = image::imageops::resize(&image::GrayImage::from_fn(rw, rh, |x, y| image::Luma([crop.get_pixel(x, y)[3]])), tw, th, image::imageops::FilterType::Nearest);
+    let mut small = image::imageops::resize(&sent, tw, th, image::imageops::FilterType::CatmullRom);
+    let alpha = image::imageops::resize(&image::GrayImage::from_fn(sw, sh, |x, y| image::Luma([sent.get_pixel(x, y)[3]])), tw, th, image::imageops::FilterType::Nearest);
     for (p, a) in small.pixels_mut().zip(alpha.pixels()) {
         p[3] = a[0];
     }
     let mut png = Vec::new();
     small.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
     let (out, translated) = prepared(req, |req| run(req, &png, &rc))?;
+    // Dernière génération gardée pour diagnostic (image envoyée, reçue, pièce posée), écrasée à chaque fois.
+    let debug = crate::library::data_dir().join("generation");
+    if std::fs::create_dir_all(&debug).is_ok() {
+        let _ = std::fs::write(debug.join("envoi.png"), &png);
+        let _ = out.save(debug.join("recu.png"));
+    }
+    // Raccord des teintes à la taille d'envoi, avant l'agrandissement : agrandir un saut de teinte au bord
+    // laissait un liseré (rebond de l'interpolation) que la correction ne pouvait plus effacer.
+    let mut out = if out.dimensions() == (tw, th) { out } else { image::imageops::resize(&out, tw, th, image::imageops::FilterType::CatmullRom) };
+    let small_hole: Vec<f32> = small.pixels().map(|p| if p[3] < 128 { 1.0 } else { 0.0 }).collect();
+    match_context(&mut out, &small, &small_hole);
+    let (sx, sy) = (tw as f32 / sw as f32, th as f32 / sh as f32);
+    let (ox, oy) = ((pads[0] as f32 * sx).round() as u32, (pads[1] as f32 * sy).round() as u32);
+    let (cw, ch) = (((rw as f32 * sx).round() as u32).clamp(1, tw - ox), ((rh as f32 * sy).round() as u32).clamp(1, th - oy));
+    let out = image::imageops::crop_imm(&out, ox, oy, cw, ch).to_image();
     let mut out = image::imageops::resize(&out, rw, rh, image::imageops::FilterType::CatmullRom);
-    match_context(&mut out, &crop, &hole);
+    match_grain(&mut out, &crop, &hole, req.seed);
+    // Hors de la zone, la pièce reprend la photo : le fondu du bord mêle alors la photo et le résultat
+    // corrigé, et non une copie du contexte repassée par le modèle (liseré sombre ou clair sinon).
+    for (i, p) in out.pixels_mut().enumerate() {
+        if hole[i] < 0.5 {
+            let o = crop.get_pixel(i as u32 % rw, i as u32 / rw);
+            *p = image::Rgb([o[0], o[1], o[2]]);
+        }
+    }
     let soft = blur(&hole, rw, rh, ((rw.max(rh) / 300) as usize).max(2));
-    let px = out
+    let px: Vec<[f32; 4]> = out
         .pixels()
         .zip(&soft)
         .map(|(p, a)| {
@@ -642,6 +816,12 @@ pub fn generate(img: &impl Canvas, strokes: &[BrushStroke], req: &Request) -> Re
         })
         .collect();
     let rect = [r[0] as f32 / w as f32, r[1] as f32 / h as f32, rw as f32 / w as f32, rh as f32 / h as f32];
+    let _ = image::RgbaImage::from_fn(rw, rh, |x, y| {
+        let p: &[f32; 4] = &px[(y * rw + x) as usize];
+        image::Rgba([0, 1, 2, 3].map(|k| if k == 3 { (p[3] * 255.0 + 0.5) as u8 } else { (to_srgb(p[k]) * 255.0 + 0.5) as u8 }))
+    })
+    .save(debug.join("piece.png"));
+    let _ = crop.save(debug.join("photo.png"));
     Ok((Patch { rect, w: rw, h: rh, px }, translated))
 }
 
@@ -659,16 +839,148 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn essai_faux_bord() {
+        // Zone collée aux bords droit et haut ; le faux moteur (LUMINUX_SD) y ajoute une bande claire et
+        // une teinte verte, comme SDXL au bord de l'image générée. Elles ne doivent pas arriver sur la photo.
+        let Ok(model) = std::env::var("LUMINUX_FAKE_MODEL") else { return };
+        let (w, h) = (1600u32, 2400u32);
+        let mut data: Vec<[f32; 4]> = (0..w * h).map(|i| { let t = (i % w) as f32 / w as f32; [0.02 + 0.03 * (1.0 - t), 0.02, 0.03, 1.0] }).collect();
+        let orig = data.clone();
+        let canvas = crate::retouch::F32Canvas { data: &mut data, w, h };
+        let strokes = vec![BrushStroke { points: vec![[0.6, 0.0], [1.0, 0.0], [1.0, 0.5], [0.6, 0.5]], radius: 0.0005, hardness: 0.9, flow: 1.0, erase: false, fill: true }];
+        let id = format!("local:{model}");
+        let req = Request { url: "", model: &id, prompt: "ciel", negative: "", seed: 1, strength: 1.0, inpaint_denoise: None, refine: false, ollama: None, translate: None };
+        let (p, _) = generate(&canvas, &strokes, &req).unwrap();
+        let (px0, py0) = ((p.rect[0] * w as f32).round() as u32, (p.rect[1] * h as f32).round() as u32);
+        let mut comp = orig.clone();
+        for y in 0..p.h {
+            for x in 0..p.w {
+                let q = p.px[(y * p.w + x) as usize];
+                let o = &mut comp[((py0 + y) * w + px0 + x) as usize];
+                for k in 0..3 {
+                    o[k] = o[k] * (1.0 - q[3]) + q[k] * q[3];
+                }
+            }
+        }
+        let mean = |x0: u32, x1: u32, y0: u32, y1: u32, k: usize| {
+            let mut s = 0.0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    s += to_srgb(comp[(y * w + x) as usize][k]);
+                }
+            }
+            s / ((x1 - x0) * (y1 - y0)) as f32
+        };
+        let (bord, avant) = (mean(w - 8, w, 300, 900, 0), mean(w - 80, w - 40, 300, 900, 0));
+        let (haut, dessous) = (mean(1100, 1400, 0, 8, 1), mean(1100, 1400, 60, 100, 1));
+        if let Ok(f) = std::env::var("LUMINUX_FAKE_OUT") {
+            let _ = image::RgbImage::from_fn(w, h, |x, y| image::Rgb(comp[(y * w + x) as usize].map(|c| (to_srgb(c) * 255.0) as u8)[..3].try_into().unwrap())).save(f);
+        }
+        assert!((bord - avant).abs() < 0.03, "bande droite : {bord} contre {avant}");
+        assert!((haut - dessous).abs() < 0.03, "bande haute : {haut} contre {dessous}");
+    }
+
+    #[test]
+    #[ignore]
+    fn essai_faux_moteur() {
+        // Faux moteur (LUMINUX_SD) : fond de zone éclairci et disque rouge ; LUMINUX_FAKE_MODEL : fichier modèle.
+        // LUMINUX_FAKE_OUT : image composée écrite pour inspection.
+        let Ok(model) = std::env::var("LUMINUX_FAKE_MODEL") else { return };
+        let (w, h) = (2400u32, 1600u32);
+        // Ciel en dégradé avec un grain léger.
+        let mut seed = 1u32;
+        let mut data: Vec<[f32; 4]> = (0..w * h)
+            .map(|i| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = (seed >> 8) as f32 / 16777216.0 - 0.5;
+                let t = (i / w) as f32 / h as f32;
+                [0.30 + 0.10 * t + 0.01 * n, 0.50 + 0.10 * t + 0.01 * n, 0.95 + 0.01 * n, 1.0]
+            })
+            .collect();
+        let orig = data.clone();
+        let canvas = crate::retouch::F32Canvas { data: &mut data, w, h };
+        let (x0, y0, x1, y1) = (0.40f32, 0.30f32, 0.62f32, 0.62f32);
+        let strokes = vec![BrushStroke { points: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]], radius: 0.0005, hardness: 0.9, flow: 1.0, erase: false, fill: true }];
+        let id = format!("local:{model}");
+        let req = Request { url: "", model: &id, prompt: "roses", negative: "", seed: 1, strength: 1.0, inpaint_denoise: None, refine: false, ollama: None, translate: None };
+        let (p, _) = generate(&canvas, &strokes, &req).unwrap();
+        // Composition comme à l'écran.
+        let (px0, py0) = ((p.rect[0] * w as f32).round() as u32, (p.rect[1] * h as f32).round() as u32);
+        let mut comp = orig.clone();
+        for y in 0..p.h {
+            for x in 0..p.w {
+                let q = p.px[(y * p.w + x) as usize];
+                let o = &mut comp[((py0 + y) * w + px0 + x) as usize];
+                for k in 0..3 {
+                    o[k] = o[k] * (1.0 - q[3]) + q[k] * q[3];
+                }
+            }
+        }
+        let at = |fx: f32, fy: f32| comp[((fy * h as f32) as u32 * w + (fx * w as f32) as u32) as usize];
+        // Saut au bord : moyenne d'une bande juste dedans contre juste dehors (bord gauche, sur la hauteur).
+        let band = |fx0: f32, fx1: f32| {
+            let mut s = [0.0f32; 3];
+            let mut n = 0.0;
+            for yy in ((y0 + 0.05) * h as f32) as u32..((y1 - 0.05) * h as f32) as u32 {
+                for xx in (fx0 * w as f32) as u32..(fx1 * w as f32) as u32 {
+                    let o = comp[(yy * w + xx) as usize];
+                    (0..3).for_each(|k| s[k] += o[k]);
+                    n += 1.0;
+                }
+            }
+            s.map(|v| v / n)
+        };
+        let (inner, outer) = (band(x0 + 0.003, x0 + 0.012), band(x0 - 0.012, x0 - 0.003));
+        let centre = at(0.51, 0.46);
+        eprintln!("centre {centre:?} bord dedans {inner:?} dehors {outer:?}");
+        if let Ok(f) = std::env::var("LUMINUX_FAKE_OUT") {
+            let img = image::RgbImage::from_fn(w, h, |x, y| {
+                let o = comp[(y * w + x) as usize];
+                image::Rgb(o.map(|c| (to_srgb(c) * 255.0 + 0.5) as u8)[..3].try_into().unwrap())
+            });
+            img.save(f).unwrap();
+        }
+        assert!(centre[0] > 0.25 && centre[1] < 0.05 && centre[2] < 0.05, "disque rouge perdu : {centre:?}");
+        assert!((0..3).all(|k| (inner[k] - outer[k]).abs() < 0.01), "saut au bord : {inner:?} / {outer:?}");
+    }
+
+    #[test]
     fn context_colours_are_matched() {
-        // Fond bleu ; le modèle a rendu toute la pièce plus claire (+40) : après raccord, le fond de la zone
+        // Fond bleu ; le modèle a rendu l'intérieur de la zone plus clair (+40) : après raccord, le fond de la zone
         // retrouve la teinte de la photo.
         let (w, h) = (120u32, 100u32);
         let orig = image::RgbaImage::from_pixel(w, h, image::Rgba([90, 120, 200, 255]));
-        let mut out = image::RgbImage::from_pixel(w, h, image::Rgb([130, 160, 240]));
         let hole: Vec<f32> = (0..w * h).map(|i| if (30..90).contains(&(i % w)) && (25..75).contains(&(i / w)) { 1.0 } else { 0.0 }).collect();
+        // Le modèle garde le contexte mais éclaircit l'intérieur de la zone (+40), avec un objet rouge au centre.
+        let mut out = image::RgbImage::from_fn(w, h, |x, y| {
+            if (55..65).contains(&x) && (45..55).contains(&y) { image::Rgb([200, 20, 30]) }
+            else if hole[(y * w + x) as usize] > 0.5 { image::Rgb([130, 160, 240]) } else { image::Rgb([90, 120, 200]) }
+        });
         match_context(&mut out, &orig, &hole);
-        let p = out.get_pixel(60, 50);
-        assert!(p.0.iter().zip([90u8, 120, 200]).all(|(a, b)| (*a as i32 - b as i32).abs() <= 2), "{p:?}");
+        let p = out.get_pixel(40, 35);
+        assert!(p.0.iter().zip([90u8, 120, 200]).all(|(a, b)| (*a as i32 - b as i32).abs() <= 3), "fond : {p:?}");
+        let r = out.get_pixel(60, 50);
+        assert!(r[0] > 140 && r[1] < 30, "objet : {r:?}");
+    }
+
+    #[test]
+    fn zone_on_photo_edge_gets_mirrored_margin() {
+        let (w, h) = (40u32, 20u32);
+        // Zone collée au bord droit et au bord haut seulement.
+        let hole: Vec<f32> = (0..w * h).map(|i| if i % w >= 25 && i / w < 12 { 1.0 } else { 0.0 }).collect();
+        let pads = edge_pads(&hole, w, h);
+        assert_eq!((pads[0], pads[3]), (0, 0));
+        assert!(pads[1] > 0 && pads[2] > 0, "{pads:?}");
+        let img = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba([x as u8, y as u8, 0, 255]));
+        let p = mirror_pad(&img, pads);
+        assert_eq!(p.dimensions(), (w + pads[2], h + pads[1]));
+        // L'original est à sa place, la marge le reflète.
+        assert_eq!(p.get_pixel(5, pads[1] + 3).0[..2], [5, 3]);
+        assert_eq!(p.get_pixel(w, pads[1]).0[0], (w - 1) as u8);
+        assert_eq!(p.get_pixel(w + 1, pads[1]).0[0], (w - 2) as u8);
+        assert_eq!(p.get_pixel(0, pads[1] - 1).0[1], 0);
+        assert_eq!(p.get_pixel(0, pads[1] - 2).0[1], 1);
     }
 
     #[test]
@@ -682,11 +994,15 @@ mod tests {
 
     #[test]
     fn graph_uses_mask_from_alpha() {
-        let req = Request { url: "", model: "m.safetensors", prompt: "ciel", negative: "", seed: 7, strength: 0.9, inpaint_denoise: None, ollama: None, translate: None };
+        let req = Request { url: "", model: "m.safetensors", prompt: "ciel", negative: "", seed: 7, strength: 0.9, inpaint_denoise: None, refine: false, ollama: None, translate: None };
         let g = graph(&req, "luminux.png", &recipe(req.model));
         assert_eq!(g["6"]["inputs"]["mask"], json!(["2", 1]));
         assert_eq!(g["7"]["inputs"]["seed"], json!(7));
         assert!((g["7"]["inputs"]["denoise"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+        assert_eq!(g["7"]["inputs"]["latent_image"], json!(["6", 2]));
+        let g = graph(&Request { refine: true, ..req }, "x.png", &recipe("m.safetensors"));
+        assert_eq!(g["6"]["inputs"]["mask"], json!(["10", 0]));
+        assert_eq!(g["7"]["inputs"]["latent_image"], json!(["11", 0]));
     }
 
     #[test]

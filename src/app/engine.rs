@@ -66,6 +66,9 @@ impl App {
         if chosen.is_empty() && !sdlocal::installed(asset) {
             v.push(asset);
         }
+        if !upscale && *chosen == sdlocal::GEN_MODEL_XL.file && !sdlocal::installed(&sdlocal::GEN_MODEL_XL) {
+            v.push(&sdlocal::GEN_MODEL_XL);
+        }
         v
     }
 
@@ -145,6 +148,20 @@ impl App {
             ui.small(t!("Moteur et modèles installés."));
         } else {
             self.local_install_ui(ui, missing);
+        }
+        // Choix rapide entre les deux modèles proposés au téléchargement.
+        let mut pick = if self.settings.local_model.is_empty() { 0u8 } else if self.settings.local_model == sdlocal::GEN_MODEL_XL.file { 1 } else { 2 };
+        let before = pick;
+        ui.horizontal(|ui| {
+            ui.label(t!("Modèle"));
+            segmented(ui, &mut pick, &[(0, t!("SD 1.5 (léger, 2,1 Go)")), (1, t!("SDXL (meilleur, 6,9 Go)"))]);
+        });
+        if pick != before {
+            self.settings.local_model = if pick == 1 { sdlocal::GEN_MODEL_XL.file.to_string() } else { String::new() };
+            self.settings.save();
+        }
+        if pick == 1 {
+            ui.small(t!("SDXL : 8 Go de mémoire vidéo conseillés, génération plus lente. Si le téléchargement échoue, « Autre modèle… » accepte le même fichier copié depuis un serveur ComfyUI (dossier models/checkpoints)."));
         }
         ui.label(tf!("Génération : {0}", sdlocal::model_name(&self.settings.gen_model())));
         ui.horizontal(|ui| {

@@ -393,10 +393,18 @@ fn new_session(m: Model, gpu: bool) -> Result<ort::session::Session> {
 }
 
 /// Exécute le réseau sur une image sRGB `w`x`h` (0..1) ; renvoie la carte du réseau en 0..1.
-fn infer(m: Model, rgb: &[[f32; 4]], w: u32, h: u32) -> Result<(u32, Vec<f32>)> {
+fn infer(m: Model, rgb: &[[f32; 4]], w: u32, h: u32) -> Result<(u32, u32, Vec<f32>)> {
     ensure_ort()?;
     let sp = spec(m);
     let s = sp.size;
+    if let Some(classes) = m.scene_classes() {
+        // Scène : par tuiles, l'image entière réduite à 512 × 512 rendant les personnes ou objets
+        // lointains trop petits (et déformés) pour être reconnus.
+        return tiled(rgb, w, h, s, |tile| {
+            let (side, map) = scene_mask(&run_tile(m, tile, s)?, classes)?;
+            Ok(resample(&map, side, side, s, s))
+        });
+    }
     let small = resize(rgb, w, h, s, s);
     let mx = if sp.rembg_norm { small.iter().flat_map(|p| p[..3].iter().copied()).fold(1e-6f32, f32::max) } else { 1.0 };
     let plane = (s * s) as usize;
@@ -408,9 +416,6 @@ fn infer(m: Model, rgb: &[[f32; 4]], w: u32, h: u32) -> Result<(u32, Vec<f32>)> 
     }
     let tensor = ort::value::Tensor::from_array(([1usize, 3, s as usize, s as usize], input)).map_err(|e| anyhow!("{e}"))?;
     let (shape, data) = run(m, vec![tensor.into()])?;
-    if let Some(classes) = m.scene_classes() {
-        return scene_mask(&shape, &data, classes);
-    }
     // Sortie [1, 1, s, s] : premier canal.
     let n = shape.iter().rev().take(2).product::<i64>() as usize;
     let side = *shape.last().unwrap_or(&0) as u32;
@@ -419,15 +424,72 @@ fn infer(m: Model, rgb: &[[f32; 4]], w: u32, h: u32) -> Result<(u32, Vec<f32>)> 
     }
     let map = &data[..n];
     if !sp.rembg_norm && m != Model::Depth {
-        return Ok((side, map.iter().map(|v| v.clamp(0.0, 1.0)).collect()));
+        return Ok((side, side, map.iter().map(|v| v.clamp(0.0, 1.0)).collect()));
     }
     let (lo, hi) = map.iter().fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
-    Ok((side, map.iter().map(|v| (v - lo) / (hi - lo).max(1e-6)).collect()))
+    Ok((side, side, map.iter().map(|v| (v - lo) / (hi - lo).max(1e-6)).collect()))
+}
+
+/// Exécute le réseau sur une tuile carrée `s`x`s` sRGB (0..1), normalisée ImageNet ; renvoie (forme, valeurs).
+fn run_tile(m: Model, tile: &[[f32; 4]], s: u32) -> Result<(Vec<i64>, Vec<f32>)> {
+    let sp = spec(m);
+    let plane = (s * s) as usize;
+    let mut input = vec![0f32; 3 * plane];
+    for (i, p) in tile.iter().enumerate() {
+        for c in 0..3 {
+            input[c * plane + i] = (p[c] - sp.mean[c]) / sp.std[c];
+        }
+    }
+    let tensor = ort::value::Tensor::from_array(([1usize, 3, s as usize, s as usize], input)).map_err(|e| anyhow!("{e}"))?;
+    run(m, vec![tensor.into()])
+}
+
+/// Débuts des tuiles de `tile` le long d'un côté de `len`, chevauchées d'un quart au moins.
+fn tile_starts(len: u32, tile: u32) -> Vec<u32> {
+    if len <= tile {
+        return vec![0];
+    }
+    let n = (len - tile).div_ceil(tile * 3 / 4) + 1;
+    (0..n).map(|k| ((len - tile) as u64 * k as u64 / (n - 1) as u64) as u32).collect()
+}
+
+/// Carte d'un réseau à entrée carrée `tile`, calculée par tuiles chevauchées sur l'image ramenée à un
+/// petit côté de 1024 px (3072 px au plus en long) ; les tuiles sont fondues par une pondération en
+/// toit, sans couture. `f` reçoit une tuile `tile`x`tile` et rend sa carte à la même taille.
+fn tiled(rgb: &[[f32; 4]], w: u32, h: u32, tile: u32, mut f: impl FnMut(&[[f32; 4]]) -> Result<Vec<f32>>) -> Result<(u32, u32, Vec<f32>)> {
+    let k = (1024.0 / w.min(h) as f32).min(3072.0 / w.max(h) as f32);
+    let (ww, wh) = (((w as f32 * k).round() as u32).max(tile), ((h as f32 * k).round() as u32).max(tile));
+    let work = resize(rgb, w, h, ww, wh);
+    let mut acc = vec![0f32; (ww * wh) as usize];
+    let mut wsum = vec![0f32; (ww * wh) as usize];
+    let roof = |i: u32| ((i.min(tile - 1 - i) as f32 + 1.0) / (tile as f32 / 2.0)).clamp(0.02, 1.0);
+    let mut buf = vec![[0f32; 4]; (tile * tile) as usize];
+    for &y0 in &tile_starts(wh, tile) {
+        for &x0 in &tile_starts(ww, tile) {
+            for y in 0..tile {
+                let row = ((y0 + y) * ww + x0) as usize;
+                buf[(y * tile) as usize..((y + 1) * tile) as usize].copy_from_slice(&work[row..row + tile as usize]);
+            }
+            let map = f(&buf)?;
+            if map.len() < (tile * tile) as usize {
+                bail!("carte de tuile incomplète");
+            }
+            for y in 0..tile {
+                for x in 0..tile {
+                    let wt = roof(x) * roof(y);
+                    let o = ((y0 + y) * ww + x0 + x) as usize;
+                    acc[o] += map[(y * tile + x) as usize] * wt;
+                    wsum[o] += wt;
+                }
+            }
+        }
+    }
+    Ok((ww, wh, acc.iter().zip(&wsum).map(|(a, s)| a / s.max(1e-6)).collect()))
 }
 
 /// Probabilité (softmax sur les classes) que chaque pixel appartienne à l'une des `classes`.
-fn scene_mask(shape: &[i64], logits: &[f32], classes: &[usize]) -> Result<(u32, Vec<f32>)> {
-    let [_, k, h, w] = shape else { bail!("sortie inattendue du modèle : {shape:?}") };
+fn scene_mask((shape, logits): &(Vec<i64>, Vec<f32>), classes: &[usize]) -> Result<(u32, Vec<f32>)> {
+    let [_, k, h, w] = shape.as_slice() else { bail!("sortie inattendue du modèle : {shape:?}") };
     let (k, h, w) = (*k as usize, *h as usize, *w as usize);
     if k < 150 || h != w || logits.len() < k * h * w {
         bail!("sortie inattendue du modèle : {shape:?}");
@@ -640,8 +702,8 @@ impl AiMask {
 
 /// Calcule le masque à partir de l'image guide (sRGB, `w`x`h`, sans réglages).
 pub fn compute(m: Model, guide: &[[f32; 4]], w: u32, h: u32) -> Result<AiMask> {
-    let (side, raw) = infer(m, guide, w, h)?;
-    let coarse = resample(&raw, side, side, w, h);
+    let (rw, rh, raw) = infer(m, guide, w, h)?;
+    let coarse = resample(&raw, rw, rh, w, h);
     let luma: Vec<f32> = guide.iter().map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]).collect();
     // Rayon proportionnel à la taille (≈ 8 px pour 2048 px), le réseau ayant vu une image réduite.
     let r = ((w.max(h) as f32 / 256.0).round() as usize).max(2);
@@ -1058,10 +1120,36 @@ mod tests {
         let (k, plane) = (150usize, 4usize);
         let mut logits = vec![0f32; k * plane];
         logits[12 * plane] = 10.0;
-        let (side, m) = scene_mask(&[1, 150, 2, 2], &logits, Model::People.scene_classes().unwrap()).unwrap();
+        let (side, m) = scene_mask(&(vec![1, 150, 2, 2], logits.clone()), Model::People.scene_classes().unwrap()).unwrap();
         assert_eq!(side, 2);
         assert!(m[0] > 0.99 && (m[1] - 1.0 / 150.0).abs() < 1e-4);
-        assert!(scene_mask(&[1, 1, 2, 2], &logits, &[0]).is_err());
+        assert!(scene_mask(&(vec![1, 1, 2, 2], logits), &[0]).is_err());
+    }
+
+    #[test]
+    fn tiles_cover_tall_photo_without_seams() {
+        assert_eq!(tile_starts(512, 512), vec![0]);
+        let t = tile_starts(2226, 512);
+        assert_eq!((t[0], *t.last().unwrap()), (0, 2226 - 512));
+        assert!(t.windows(2).all(|p| p[1] - p[0] <= 384));
+        // Photo de téléphone en hauteur (1840 × 4000) : la « carte » rendue est le rouge de chaque
+        // pixel de la tuile ; le résultat doit redonner le dégradé de l'image, sans couture.
+        let (w, h) = (184u32, 400u32);
+        let rgb: Vec<[f32; 4]> = (0..w * h).map(|i| [(i % w) as f32 / w as f32, 0.0, 0.0, 1.0]).collect();
+        let mut n = 0;
+        let (ww, wh, map) = tiled(&rgb, w, h, 512, |tile| {
+            n += 1;
+            Ok(tile.iter().map(|p| p[0]).collect())
+        })
+        .unwrap();
+        assert_eq!((ww, wh), (1024, 2226));
+        assert_eq!(n, 3 * 6);
+        for y in (0..wh).step_by(37) {
+            for x in (0..ww).step_by(29) {
+                let want = (x as f32 + 0.5) / ww as f32;
+                assert!((map[(y * ww + x) as usize] - want).abs() < 0.02, "({x}, {y})");
+            }
+        }
     }
 
     #[test]

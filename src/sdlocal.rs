@@ -14,8 +14,8 @@ use std::process::Command;
 pub const PREFIX: &str = "local:";
 
 /// Version de stable-diffusion.cpp utilisée (binaires officiels Linux Vulkan, Ubuntu 24.04).
-const VERSION: &str = "master-920-2f88688";
-const ENGINE_URL: &str = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-920-2f88688/sd-master-2f88688-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip";
+const VERSION: &str = "master-987-a77d362";
+const ENGINE_URL: &str = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-987-a77d362/sd-master-a77d362-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip";
 
 /// Fichier à télécharger : nom, adresse, taille annoncée (Mo).
 pub struct Asset {
@@ -25,12 +25,20 @@ pub struct Asset {
 }
 
 /// Programme (archive zip, décompressée à l'installation).
-pub const ENGINE: Asset = Asset { file: "stable-diffusion.cpp", url: ENGINE_URL, mb: 37 };
+pub const ENGINE: Asset = Asset { file: "stable-diffusion.cpp", url: ENGINE_URL, mb: 35 };
 /// Modèle de génération conseillé : SD 1.5 inpainting (raccords propres, 4 Go de carte graphique suffisent).
 pub const GEN_MODEL: Asset = Asset {
     file: "stable-diffusion-v1-5-inpainting-FP16.gguf",
     url: "https://huggingface.co/gpustack/stable-diffusion-v1-5-inpainting-GGUF/resolve/main/stable-diffusion-v1-5-inpainting-FP16.gguf",
     mb: 2130,
+};
+/// Modèle de génération fort : SDXL inpainting 0.1 (celui du serveur ComfyUI de Franck), lu tel quel par
+/// stable-diffusion.cpp ; 8 Go de carte graphique avec le texte encodé par le processeur.
+/// Adresse relevée par recherche web le 2026-10-21, téléchargement non essayé ici (Hugging Face bloqué).
+pub const GEN_MODEL_XL: Asset = Asset {
+    file: "sd_xl_base_1.0_inpainting_0.1.safetensors",
+    url: "https://huggingface.co/wangqyqq/sd_xl_base_1.0_inpainting_0.1.safetensors/resolve/main/sd_xl_base_1.0_inpainting_0.1.safetensors",
+    mb: 6940,
 };
 /// Modèle d'agrandissement conseillé : Real-ESRGAN x4 (photos).
 pub const UPSCALE_MODEL: Asset = Asset { file: "RealESRGAN_x4plus.pth", url: "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth", mb: 64 };
@@ -120,6 +128,13 @@ pub fn install(a: &Asset, progress: &Progress) -> Result<()> {
     let _ = std::fs::remove_dir_all(engine_dir());
     std::fs::rename(&tmp, engine_dir())?;
     let _ = std::fs::remove_file(&zip);
+    // Versions précédentes du moteur : plus utilisées.
+    for e in std::fs::read_dir(dir()).into_iter().flatten().flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        if n.starts_with("master-") && n != VERSION && e.path().is_dir() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
     Ok(())
 }
 
@@ -204,7 +219,17 @@ fn inpaint_args(model: &Path, init: &Path, mask: &Path, out: &Path, w: u32, h: u
     // Graine positive : une graine négative serait tirée au hasard.
     push("-s", (s.seed & 0x7fff_ffff_ffff).to_string().into());
     push("-o", out.into());
+    if is_xl(model) {
+        // SDXL : encodeurs de texte sur le processeur et décodage par tuiles pour tenir dans 8 Go.
+        a.push("--clip-on-cpu".into());
+        a.push("--vae-tiling".into());
+    }
     a
+}
+
+/// Modèle de la famille SDXL (d'après son nom).
+pub fn is_xl(model: &Path) -> bool {
+    model.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains("xl"))
 }
 
 /// Génère dans `img` (taille multiple de 8) là où l'alpha est nul ; renvoie l'image produite.
@@ -274,6 +299,8 @@ mod tests {
         assert_eq!((val("-W"), val("-H")), ("640".into(), "448".into()));
         assert!(!val("-s").starts_with('-'));
         assert!(!a.contains(&"-n".to_string()));
+        assert!(!a.contains(&"--clip-on-cpu".to_string()));
+        assert!(is_xl(&model_file(&model_id(GEN_MODEL_XL.file))));
     }
 
     /// Essai avec le vrai moteur : LUMINUX_SD=…/sd-cli LUMINUX_ESSAI_UP=modele.pth cargo test essai_local -- --ignored

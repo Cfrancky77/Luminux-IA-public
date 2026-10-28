@@ -2307,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "luminux"
-version = "0.28.3"
+version = "0.33.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
