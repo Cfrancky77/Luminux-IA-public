@@ -32,7 +32,7 @@ pub const GEN_MODEL: Asset = Asset {
     url: "https://huggingface.co/gpustack/stable-diffusion-v1-5-inpainting-GGUF/resolve/main/stable-diffusion-v1-5-inpainting-FP16.gguf",
     mb: 2130,
 };
-/// Modèle de génération fort : SDXL inpainting 0.1 (celui du serveur ComfyUI de Franck), lu tel quel par
+/// Modèle de génération fort : SDXL inpainting 0.1 (celui du serveur ComfyUI), lu tel quel par
 /// stable-diffusion.cpp ; 8 Go de carte graphique avec le texte encodé par le processeur.
 /// Adresse relevée par recherche web le 2026-10-21, téléchargement non essayé ici (Hugging Face bloqué).
 pub const GEN_MODEL_XL: Asset = Asset {

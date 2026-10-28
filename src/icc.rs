@@ -103,8 +103,8 @@ mod tests {
 
     #[test]
     fn colormgr_output() {
-        let text = "Object Path:   /org/freedesktop/ColorManager/devices/xrandr_DP_1\nProfile 1:     icc-abc\n               /home/franck/.local/share/icc/edid-123.icc\n";
-        assert_eq!(profile_in(text), Some(PathBuf::from("/home/franck/.local/share/icc/edid-123.icc")));
+        let text = "Object Path:   /org/freedesktop/ColorManager/devices/xrandr_DP_1\nProfile 1:     icc-abc\n               /home/user/.local/share/icc/edid-123.icc\n";
+        assert_eq!(profile_in(text), Some(PathBuf::from("/home/user/.local/share/icc/edid-123.icc")));
         assert_eq!(profile_in("Object Path: /org/x\n"), None);
     }
 }

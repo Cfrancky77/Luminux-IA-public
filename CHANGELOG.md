@@ -3,6 +3,10 @@
 Toutes les versions de Luminux IA, de la plus récente à la plus ancienne. Chaque release GitHub
 reprend la section de sa version.
 
+## [0.33.2] - 2026-10-28
+
+- Nettoyage : plus aucune référence personnelle dans le code source (tests et commentaires).
+
 ## [0.33.1] - 2026-10-22
 
 - Gomme ComfyUI : la repasse ne présente plus au modèle un trou gris à combler (qui l'invitait à

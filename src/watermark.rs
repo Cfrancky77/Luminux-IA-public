@@ -162,7 +162,7 @@ mod tests {
     fn text_lands_in_the_chosen_corner_with_the_chosen_width() {
         let (w, h) = (400u32, 200u32);
         let mut rgb = vec![0f32; (w * h * 3) as usize];
-        let wm = Watermark { kind: Kind::Text, text: "© Franck".into(), width: 0.25, opacity: 1.0, ..Default::default() };
+        let wm = Watermark { kind: Kind::Text, text: "© Auteur".into(), width: 0.25, opacity: 1.0, ..Default::default() };
         apply(&wm, w, h, &mut rgb);
         let lit: Vec<(u32, u32)> = (0..w * h).filter(|i| rgb[*i as usize * 3] > 0.5).map(|i| (i % w, i / w)).collect();
         assert!(!lit.is_empty());
