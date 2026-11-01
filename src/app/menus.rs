@@ -7,10 +7,11 @@ use super::*;
 const ZOOMS: [f32; 4] = [1.0, 1.25, 1.5, 2.0];
 
 /// Raccourcis clavier : (touches, action).
-const KEYS: [(&str, &str); 27] = [
+const KEYS: [(&str, &str); 28] = [
     (k!("Ctrl+N"), k!("Nouveau document")),
     (k!("Ctrl+O"), k!("Ouvrir une photo")),
     (k!("Ctrl+E"), k!("Exporter")),
+    (k!("Ctrl+P"), k!("Imprimer")),
     (k!("Ctrl+Z"), k!("Annuler|défaire")),
     (k!("Ctrl+Maj+Z"), k!("Rétablir")),
     (k!("Ctrl+Maj+C"), k!("Copier les réglages")),
@@ -59,6 +60,9 @@ impl App {
                 ui.hyperlink_to(t!("Mode d'emploi (en ligne)"), "https://github.com/Cfrancky77/Luminux-IA-public/blob/main/LISEZMOI.md");
                 ui.hyperlink_to(t!("Journal des versions (en ligne)"), "https://github.com/Cfrancky77/Luminux-IA-public/blob/main/CHANGELOG.md");
                 ui.separator();
+                if item(ui, self.update_rx.is_none(), t!("Rechercher une mise à jour"), "") {
+                    self.start_update_check(&ctx, true);
+                }
                 if item(ui, true, t!("À propos de Luminux IA…"), "") {
                     self.about_open = true;
                 }
@@ -84,6 +88,9 @@ impl App {
         let label = if self.mode == Mode::Library { tf!("Exporter ({n})…", self.targets().len()) } else { t!("Exporter…").to_string() };
         if item(ui, can_export && self.batch.is_none(), &label, "Ctrl+E") {
             self.export_open = true;
+        }
+        if item(ui, self.mode == Mode::Editor && self.size.is_some(), t!("Imprimer…"), "Ctrl+P") {
+            self.print_open = true;
         }
         ui.separator();
         if item(ui, true, t!("Quitter"), "Ctrl+Q") {
@@ -270,7 +277,7 @@ impl App {
         if !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             return false;
         }
-        let flags = [&mut self.keys_open, &mut self.about_open, &mut self.prefs_open, &mut self.export_open];
+        let flags = [&mut self.keys_open, &mut self.about_open, &mut self.prefs_open, &mut self.export_open, &mut self.print_open];
         for f in flags {
             if *f {
                 *f = false;

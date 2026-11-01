@@ -277,6 +277,29 @@ fn value_noise(p: vec2<f32>) -> f32 {
     return mix(mix(a, b, s.x), mix(c, d, s.x), s.y) - 0.5;
 }
 
+// Orientation de l'image recadrée (tone2.w) : bits 0-1 = quarts de tour horaires, bit 2 = miroir
+// horizontal. Image de sortie -> image recadrée avant orientation. Même calcul que `orient_fwd` côté Rust.
+fn orient_uv(uv: vec2<f32>) -> vec2<f32> {
+    let o = u32(u.tone2.w + 0.5);
+    var p = uv;
+    if ((o & 4u) != 0u) {
+        p.x = 1.0 - p.x;
+    }
+    switch (o & 3u) {
+        case 1u: { p = vec2(p.y, 1.0 - p.x); }
+        case 2u: { p = vec2(1.0 - p.x, 1.0 - p.y); }
+        case 3u: { p = vec2(1.0 - p.y, p.x); }
+        default: {}
+    }
+    return p;
+}
+
+// Rapport largeur/hauteur de l'image de sortie (inversé pour un quart de tour).
+fn out_aspect(dims: vec2<f32>) -> f32 {
+    let a = u.crop.z * dims.x / (u.crop.w * dims.y);
+    return select(a, 1.0 / a, (u32(u.tone2.w + 0.5) & 1u) != 0u);
+}
+
 // Coordonnée de sortie (dans le recadrage) -> coordonnée dans la source.
 // Même convention que `crop_inside` côté Rust.
 fn geo_map(uv: vec2<f32>) -> vec2<f32> {
@@ -383,7 +406,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 fn develop_px(in: VOut, before: bool) -> vec4<f32> {
     before_px = before;
     let dims = u.geo.yz;
-    var suv = geo_map(in.uv);
+    var suv = geo_map(orient_uv(in.uv));
     // Correction d'objectif : position dans l'image corrigée -> position dans la source.
     let lens_on = u.lens.x > 0.5 && !before_px;
     var suv_r = suv;
@@ -694,7 +717,7 @@ fn develop_px(in: VOut, before: bool) -> vec4<f32> {
         e = clamp(e + r * vec3(0.08, -0.04, -0.02), vec3(0.0), vec3(1.0));
     }
     if (!before_px && u.misc.z != 0.0) {
-        let aspect = u.crop.z * dims.x / (u.crop.w * dims.y);
+        let aspect = out_aspect(dims);
         let d = length((in.uv - 0.5) * vec2(aspect, 1.0)) / length(vec2(aspect, 1.0) * 0.5);
         let k = smoothstep(u.misc.w, 1.0 + 0.001, d);
         e = clamp(e * (1.0 + u.misc.z * k), vec3(0.0), vec3(1.0));
@@ -710,7 +733,7 @@ fn develop_px(in: VOut, before: bool) -> vec4<f32> {
     }
     // Calques, du plus bas au plus haut, placés dans le cadre de sortie (taille 1 = cadre couvert).
     if (!before_px) {
-        let frame = u.crop.z * dims.x / (u.crop.w * dims.y);
+        let frame = out_aspect(dims);
         for (var i = 0; i < MAX_LAYERS; i++) {
             let a0 = u.layers[3 * i];
             let a1 = u.layers[3 * i + 1];

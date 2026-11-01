@@ -43,6 +43,7 @@ fn field_label(k: &str) -> &'static str {
         "hsl" => t!("TSL"),
         "crop" => t!("Recadrage"),
         "angle" => t!("Redressement"),
+        "orient" => t!("Orientation"),
         "sharpen" => t!("Netteté"),
         "nr_luma" | "nr_color" => t!("Réduction du bruit"),
         "vignette" | "vignette_mid" => t!("Vignettage"),

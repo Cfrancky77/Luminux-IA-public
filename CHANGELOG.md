@@ -3,6 +3,65 @@
 Toutes les versions de Luminux IA, de la plus récente à la plus ancienne. Chaque release GitHub
 reprend la section de sa version.
 
+## [0.37.1] - 2026-11-01
+
+- Icône : la forêt n'est plus que du côté « après » ; côté « avant », un fond gris avec les sapins à peine
+  esquissés au crayon.
+
+## [0.37.0] - 2026-11-01
+
+- Nouvelle icône : Tux coupé en deux comme la vue Avant/Après, terne et gris d'un côté, en couleurs avec une
+  lampe torche dans une forêt sombre de l'autre. Elle sert aussi d'icône de fenêtre (barre des tâches). Dessin inspiré de Tux, de
+  Larry Ewing (créé avec GIMP).
+
+## [0.36.1] - 2026-10-29
+
+- Signature : aperçu en direct sur la photo tant que la fenêtre Exporter ou Imprimer est ouverte (place,
+  taille, couleur, police, ombre, opacité ; le mode de fusion n'est pas montré).
+
+## [0.36.0] - 2026-10-29
+
+- Signature (ex-filigrane) enrichie, à l'export comme à l'impression : neuf positions, retraits horizontal
+  et vertical, ombre réglable, modes de fusion (normale, produit, superposition, incrustation), couleur
+  libre du texte et choix de la police (intégrée ou installée sur le système). Les réglages d'avant restent
+  valables.
+- Export : résolution (ppp) notée dans le fichier (JPEG, PNG, EXIF), avec la taille de tirage correspondante.
+- Nouveau bloc Imprimer (Ctrl+P, menu Fichier) : imprimante CUPS, papier, orientation, photo entière ou
+  feuille remplie, rotation pour remplir, marges, qualité, niveaux de gris, résolution, netteté, copies,
+  signature, aperçu de la feuille avec résolution effective. Enregistrement de la page en PDF.
+
+## [0.35.2] - 2026-10-28
+
+- Recadrage, plus lisible : une phrase explique le geste, l'interrupteur « Recadrer » est remplacé par
+  « Terminer le cadrage » / « Modifier le cadre ». Les rotations et miroirs ne font plus quitter le cadrage :
+  la photo s'affiche orientée avec le cadre, les poignées, la grille et les cadrages suggérés.
+
+## [0.35.1] - 2026-10-28
+
+- Mises à jour : « Rechercher une mise à jour » (menu Aide, Préférences) affiche le résultat dans une
+  fenêtre (à jour, nouvelle version avec lien, ou erreur) au lieu de la seule barre d'état.
+- Recadrage : la grille de composition reste affichée sur l'image tant que l'outil Recadrage est ouvert,
+  y compris après Entrée ou une rotation, quand le cadre n'est plus actif.
+
+## [0.35.0] - 2026-10-28
+
+- Avis de mise à jour : option des Préférences (décochée par défaut) qui consulte les releases du
+  dépôt public une fois par jour au plus et signale une version plus récente sous la barre d'outils
+  (lien de téléchargement, « Ignorer cette version »). Aide, « Rechercher une mise à jour » le fait
+  à la main. Aucune donnée envoyée, aucun téléchargement automatique.
+
+## [0.34.0] - 2026-10-28
+
+- Recadrage : « Redressement automatique ». Mesure l'inclinaison des lignes dominantes (horizon,
+  verticales) sur une vignette et règle le curseur ; sans ligne nette, il ne change rien.
+- Recadrage : orientation de l'image, rotations de 90° à gauche ou à droite et miroirs horizontal
+  et vertical. Appliquée à l'image recadrée, dans l'aperçu comme à l'export ; enregistrée avec
+  la photo (champ `orient` du fichier de réglages) et listée dans l'historique.
+- Recadrage : cadrages suggérés avec vignettes (tiers, centré, triangle d'or, serré, plein cadre)
+  autour du point d'intérêt de la photo, au format choisi.
+- Recadrage : choix de la grille de composition (tiers, diagonales, triangle d'or, spirale d'or,
+  centre, aucune).
+
 ## [0.33.2] - 2026-10-28
 
 - Nettoyage : plus aucune référence personnelle dans le code source (tests et commentaires).

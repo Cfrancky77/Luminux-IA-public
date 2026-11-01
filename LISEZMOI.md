@@ -54,7 +54,7 @@ Export sans fenêtre (utilise les réglages du fichier .luminux) :
 ## Menus
 
 En haut de la fenêtre : Fichier (nouveau, ouvrir, ajouter un dossier, importer des looks, exporter,
-quitter), Édition (annuler, rétablir, copier/coller les réglages, auto, réinitialiser, historique,
+imprimer, quitter), Édition (annuler, rétablir, copier/coller les réglages, auto, réinitialiser, historique,
 préférences), Affichage (bibliothèque/édition, avant/après, zoom, disposition, plein écran), Bibliothèque
 (actualiser, tri, filtre, copies virtuelles, afficher dans le dossier, informations), Accessibilité et Aide
 (raccourcis clavier avec F1, mode d'emploi, journal des versions, à propos). Les raccourcis sont écrits à droite de chaque entrée.
@@ -91,8 +91,17 @@ tri, filtre et taille des vignettes (bibliothèque), ou avant/après, zoom et no
 - « À propos » (menu Aide) : version, carte graphique, emplacement des données, bouton « Copier ces informations » pour signaler un bug.
 - Vitesse : la photo suivante (dans le sens où tu avances) est décodée pendant que tu travailles, elle s'ouvre aussitôt. Les masques Sujet et Ciel des photos du dossier affiché dans la bibliothèque (les 500 plus récentes au plus) sont calculés en arrière-plan, seulement si leurs modèles sont déjà téléchargés, en pause pendant les chargements, exports et calculs IA. Changer de dossier fait passer ses photos en premier. La progression (faites/à faire) s'affiche en bas à droite. Les masques en cache sont compressés (environ 10 fois moins de place qu'avant la 0.11.1).
 - Auto : menu Édition, « Réglages automatiques », règle exposition, blancs, noirs, ombres et vibrance d'après l'histogramme (annulable par Ctrl+Z).
-- Recadrage : touche C ou bouton « Recadrer » (section Recadrage et redressement). Glisser un coin pour redimensionner, l'intérieur pour déplacer ; Entrée ou Échap pour valider. Ratios : libre, original, 1:1, 4:3, 3:2, 16:9, 5:4, case « Vertical » pour les inverser.
+- Recadrage : l'outil Recadrage s'ouvre avec le cadre actif (touche C aussi). Glisser un coin pour redimensionner, l'intérieur pour déplacer ;
+  Entrée ou « Terminer le cadrage » pour valider, « Modifier le cadre » pour y revenir. Ratios : libre, original, 1:1, 4:3, 3:2, 16:9, 5:4,
+  « Portrait » pour les inverser.
 - Redresser : curseur en degrés (±45°) ; le cadre est réduit automatiquement pour ne jamais laisser de coins noirs.
+- Redressement automatique : mesure l'inclinaison des lignes dominantes (horizon, verticales) et règle le curseur. Heuristique sur une
+  vignette, pas un modèle d'IA : sans ligne nette (nuit, nature), il ne change rien et le dit.
+- Orientation : rotations de 90° à gauche ou à droite, miroirs horizontal et vertical. Ils s'appliquent à l'image recadrée ; le cadre, les
+  cadrages suggérés et la grille suivent l'orientation.
+- Cadrages suggérés : tiers, centré, triangle d'or, serré, plein cadre, au format choisi, autour du point d'intérêt de la photo (contraste
+  et couleur, sans IA). Un clic applique le cadre ; les vignettes se recalculent quand le redressement change.
+- Grille de composition sur le cadre : tiers, diagonales, triangle d'or, spirale d'or, centre, ou aucune.
 - Détails : netteté (masque flou sur la luminance), réduction du bruit de luminance et de couleur (filtre bilatéral qui préserve les bords).
 - Lumière : hautes lumières et ombres agissent par zones. Le poids vient de la luminosité moyenne autour du pixel,
   donc une zone sombre se débouche d'un bloc et garde son détail ; un ciel clair se tient sans griser les petits
@@ -103,15 +112,33 @@ tri, filtre et taille des vignettes (bibliothèque), ou avant/après, zoom et no
 - Exporter : Ctrl+E ou menu Fichier, qui ouvre les options : format (JPEG, WebP, AVIF en 8 bits ; PNG, TIFF en 16 bits), espace couleur (sRGB, Display P3, Adobe RGB, profil ICC intégré), taille (originale ou bord long), netteté de sortie (écran ou impression), qualité (JPEG, WebP, AVIF), EXIF gardés (avec ou sans GPS ; pas dans le TIFF). WebP est environ un tiers plus léger que le JPEG à qualité égale ; AVIF est encore plus léger mais plus lent à écrire, et toujours en sRGB (l'encodeur n'intègre pas de profil ICC). Les mêmes options servent à l'export par lots de la bibliothèque.
 - Auteur et copyright (fenêtre Exporter) : écrits dans les EXIF de chaque photo exportée (champs Artist et
   Copyright), même quand « Garder les métadonnées » est décoché.
-- Filigrane (fenêtre Exporter) : un texte (blanc ou noir, avec une ombre légère pour rester lisible) ou un logo
-  (PNG transparent conseillé), dans un coin ou au centre, avec sa largeur en pourcentage de la photo et son
-  opacité. Il n'apparaît que dans le fichier exporté, pas dans l'éditeur.
+- Résolution (fenêtre Exporter) : 72, 150, 240, 300 ppp ou une valeur libre, notée dans le fichier (JPEG,
+  PNG, EXIF) sans changer les pixels ; la fenêtre indique la taille de tirage qui en découle.
+- Signature (fenêtres Exporter et Imprimer) : un texte ou un logo (PNG transparent conseillé) posé à l'une des
+  neuf places (grille 3 × 3), avec taille en pourcentage de la largeur de la photo, opacité, ombre portée
+  (claire sous un texte foncé, foncée sinon), retraits horizontal et vertical depuis les bords et mode de
+  fusion (normale, produit, superposition, incrustation). Pour le texte : couleur libre et police intégrée
+  ou police installée sur le système (TTF, OTF). Tant que la fenêtre Exporter ou Imprimer est ouverte,
+  elle s'affiche sur la photo et suit chaque réglage (le mode de fusion n'est pas montré) ; ensuite elle
+  n'apparaît que dans le fichier exporté ou imprimé.
+- Imprimer : Ctrl+P ou menu Fichier (photo ouverte). Imprimante (CUPS, celle par défaut ou une autre),
+  papier (A4, A3, A5, Letter, Legal, 10×15, 13×18, 20×25), orientation (auto, portrait, paysage), mise en
+  page « Photo entière » ou « Remplir la feuille » (rogne au besoin), « Tourner la photo pour remplir »,
+  marges, qualité (brouillon, normale, haute), couleur ou niveaux de gris, résolution (150, 300, 600 ppp),
+  netteté d'impression, copies et signature propre à l'impression (ou reprise de celle de l'export).
+  Un aperçu montre la place de la photo sur la feuille, la taille du tirage, la résolution effective
+  (alerte sous 150 ppp) et la part rognée. La page part en PDF à la taille du papier vers `lp`, en sRGB
+  (couleurs gérées par l'imprimante). « Enregistrer en PDF… » écrit la même page dans un fichier.
 
 Les réglages sont enregistrés automatiquement dans `photo.CR2.luminux` (JSON) à côté de la photo.
 L'original n'est jamais modifié.
 
 ## Panneau de droite
 
+- Mises à jour : Préférences, case « Prévenir quand une mise à jour est disponible » (décochée par défaut). Elle consulte la liste des
+  releases du dépôt public sur GitHub au démarrage, une fois par jour au plus, et affiche un avis sous la barre d'outils avec un lien de
+  téléchargement ; « Ignorer cette version » le masque jusqu'à la suivante. Rien d'autre n'est envoyé et rien n'est téléchargé tout seul.
+  Aide, « Rechercher une mise à jour » (ou « Vérifier maintenant » dans Préférences) la lance à la main.
 - Une barre d'icônes à droite choisit l'outil affiché : Réglages, IA (outils de profondeur), Masques (réglages locaux), Recadrer, Looks,
   Ciel, Calques, Retouche, Objectif. Quitter un outil le referme (pinceau, recadrage, affichage du masque).
 - Bouton à double chevron à côté du titre du panneau, touche P, menu Affichage ou re-clic sur l'icône de l'outil
@@ -464,3 +491,10 @@ Pour la reconstruire après une modification du code : `packaging/build-appimage
     LUMINUX_DEBUG=1 ./Luminux_IA-x86_64.AppImage
 
 affiche dans le terminal le temps de décodage, de conversion et d'envoi au GPU de chaque photo ouverte.
+
+## Icône
+
+L'icône (packaging/luminux.svg) est inspirée de Tux, le manchot de Linux dessiné par Larry Ewing
+(lewing@isc.tamu.edu) avec GIMP, et redessinée pour Luminux : coupé en deux comme la vue Avant/Après,
+terne sur un fond gris à peine esquissé d'un côté, en couleurs avec une lampe torche dans une forêt sombre
+de l'autre.

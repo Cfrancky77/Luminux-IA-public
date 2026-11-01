@@ -13,6 +13,7 @@ mod ai;
 mod app;
 mod batch;
 mod comfy;
+mod composition;
 mod cull;
 mod denoise;
 mod export;
@@ -25,12 +26,14 @@ mod layers;
 mod lens;
 mod library;
 mod looks;
+mod print;
 mod masks;
 mod reshape;
 mod retouch;
 mod sdlocal;
 mod settings;
 mod sky;
+mod update;
 mod watermark;
 
 use anyhow::{Context, Result};
@@ -185,11 +188,23 @@ fn main() -> Result<()> {
         setup.device_descriptor = Arc::new(device_descriptor);
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]).with_title("Luminux IA"),
+        viewport: window_icon(egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]).with_title("Luminux IA").with_app_id("luminux")),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
         ..Default::default()
     };
     eframe::run_native("Luminux IA", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, initial)))))
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Icône de la fenêtre et de la barre des tâches (celle de l'AppImage, intégrée au binaire).
+fn window_icon(v: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    match image::load_from_memory(include_bytes!("../packaging/luminux.png")) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (width, height) = img.dimensions();
+            v.with_icon(egui::IconData { rgba: img.into_raw(), width, height })
+        }
+        Err(_) => v,
+    }
 }

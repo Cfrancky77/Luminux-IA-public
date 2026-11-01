@@ -64,6 +64,22 @@ enum Handle {
 /// Clé de rasterisation d'un masque : sa forme, l'inversion et l'opacité.
 type MaskKey = (Shape, bool, f32, bool);
 
+/// Grilles de composition affichables sur le cadre.
+const GRIDS: &[&str] = &[k!("Tiers"), k!("Diagonales"), k!("Triangle d'or"), k!("Spirale d'or"), k!("Centre"), k!("Aucune")];
+
+/// Vignette de la photo redressée (cadre entier) et son point d'intérêt, pour les cadrages suggérés.
+struct CropSuggest {
+    /// Photo, taille source et redressement pour lesquels la vignette a été rendue.
+    key: (Option<PathBuf>, Option<(u32, u32)>, u32, u8),
+    tex: egui::TextureHandle,
+    subject: [f32; 2],
+}
+
+/// Secondes écoulées depuis 1970.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
 /// Ce que l'utilisateur fait glisser en mode recadrage.
 #[derive(Clone, Copy)]
 enum CropDrag {
@@ -219,6 +235,8 @@ enum Picked {
     ScreenIcc(PathBuf),
     /// Logo du filigrane.
     WatermarkImage(PathBuf),
+    /// PDF de la page d'impression.
+    PrintPdf(PathBuf),
     /// Image d'un nouveau calque.
     LayerImage(PathBuf),
     /// Dossier à montrer dans le choix d'image de calque.
@@ -356,6 +374,13 @@ pub struct App {
     was_focused: bool,
     about_copied: bool,
     about_open: bool,
+    /// Version plus récente signalée (avis affiché sous la barre d'outils), et vérification en cours
+    /// (booléen : demandée à la main).
+    update_found: Option<crate::update::Release>,
+    /// Résultat d'une vérification demandée à la main, affiché dans une fenêtre.
+    update_msg: Option<String>,
+    update_manual: bool,
+    update_rx: Option<Receiver<(bool, Result<Option<crate::update::Release>, String>)>>,
     keys_open: bool,
     /// Panneau Informations de la bibliothèque, et détails lus pour la photo choisie.
     info_open: bool,
@@ -395,6 +420,9 @@ pub struct App {
     crop_aspect: usize,
     crop_portrait: bool,
     crop_drag: Option<CropDrag>,
+    /// Index dans GRIDS.
+    crop_grid: usize,
+    crop_sug: Option<CropSuggest>,
     looks: Vec<Look>,
     look_category: Option<String>,
     /// Aperçus des looks sur la photo ouverte, par fichier de look.
@@ -520,6 +548,16 @@ pub struct App {
     /// Dossier de la bibliothèque pour lequel les masques en arrière-plan ont été lancés.
     bg_scope: Option<Option<String>>,
     export_open: bool,
+    print_open: bool,
+    /// Imprimantes CUPS et celle par défaut, lues à l'ouverture de la fenêtre Imprimer.
+    printers: Option<(Vec<String>, Option<String>)>,
+    /// Polices du système pour la signature, lues à la première demande.
+    fonts: Option<Vec<(String, PathBuf)>>,
+    /// Le logo choisi va à la signature de l'impression (sinon à celle de l'export).
+    logo_for_print: bool,
+    printing: Option<Receiver<anyhow::Result<String>>>,
+    /// Aperçu de la signature sur la photo : clé (réglages et taille), image et place (0..1 dans l'image).
+    sig_preview: Option<(String, Option<(egui::TextureHandle, Rect)>)>,
     /// Invite à générer sur toute l'image dès que le document créé est ouvert.
     pending_gen: Option<(PathBuf, String)>,
     comfy_probe: Option<Receiver<anyhow::Result<(Vec<String>, Vec<String>)>>>,
@@ -591,6 +629,10 @@ impl App {
             was_focused: true,
             about_copied: false,
             about_open: false,
+            update_found: None,
+            update_msg: None,
+            update_manual: false,
+            update_rx: None,
             keys_open: false,
             info_open: true,
             info: None,
@@ -623,6 +665,8 @@ impl App {
             crop_aspect: 0,
             crop_portrait: false,
             crop_drag: None,
+            crop_grid: 0,
+            crop_sug: None,
             looks: looks::list(),
             look_category: None,
             look_thumbs: HashMap::new(),
@@ -710,6 +754,12 @@ impl App {
             bg_masks: None,
             bg_scope: None,
             export_open: false,
+            print_open: false,
+            printers: None,
+            fonts: None,
+            logo_for_print: false,
+            printing: None,
+            sig_preview: None,
             pending_gen: None,
             comfy_probe: None,
             comfy_upscalers: Vec::new(),
@@ -742,11 +792,107 @@ impl App {
         app.thumbs = Some(Thumbnailer::new(cc.egui_ctx.clone(), gpu));
         app.refresh_list();
         app.start_scan(&cc.egui_ctx);
+        let day = 24 * 3600;
+        if app.settings.update_check && unix_now().saturating_sub(app.settings.update_last) >= day {
+            app.start_update_check(&cc.egui_ctx, false);
+        }
         let last = app.settings.last_photo.clone().filter(|p| app.settings.start_last && p.exists());
         if let Some(p) = initial.or(last) {
             app.open(p, &cc.egui_ctx);
         }
         app
+    }
+
+    // ---------- Mises à jour ----------
+
+    /// Lance la consultation des releases en arrière-plan. `manual` : le résultat est toujours annoncé.
+    fn start_update_check(&mut self, ctx: &egui::Context, manual: bool) {
+        if self.update_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        self.update_rx = Some(rx);
+        self.update_manual = manual;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = crate::update::check(env!("CARGO_PKG_VERSION")).map_err(|e| format!("{e:#}"));
+            let _ = tx.send((manual, r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(rx) = &self.update_rx else { return };
+        let Ok((manual, result)) = rx.try_recv() else { return };
+        self.update_rx = None;
+        self.settings.update_last = unix_now();
+        self.settings.save();
+        match result {
+            Ok(Some(r)) if manual || self.settings.update_skip != r.tag => {
+                if manual {
+                    self.update_msg = Some(tf!("Une nouvelle version est disponible : {0} (installée : {1}).", r.tag, env!("CARGO_PKG_VERSION")));
+                }
+                self.update_found = Some(r);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.update_found = None;
+                if manual {
+                    self.update_msg = Some(tf!("Luminux IA {0} est à jour : aucune version plus récente n'a été publiée.", env!("CARGO_PKG_VERSION")));
+                }
+            }
+            Err(e) if manual => self.update_msg = Some(tf!("Vérification impossible : {e}", e)),
+            Err(_) => {}
+        }
+    }
+
+    /// Fenêtre du résultat d'une vérification demandée à la main, ou « en cours ».
+    fn update_window(&mut self, ctx: &egui::Context) {
+        let checking = self.update_rx.is_some() && self.update_manual;
+        if self.update_msg.is_none() && !checking {
+            return;
+        }
+        let mut close = false;
+        egui::Window::new(t!("Mise à jour")).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(ctx, |ui| {
+            if checking {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(t!("Recherche d'une mise à jour…"));
+                });
+                return;
+            }
+            if let Some(msg) = &self.update_msg {
+                ui.label(msg.as_str());
+            }
+            if let Some(r) = &self.update_found {
+                ui.hyperlink_to(t!("Télécharger"), &r.url);
+            }
+            if ui.button(t!("Fermer")).clicked() {
+                close = true;
+            }
+        });
+        if close {
+            self.update_msg = None;
+        }
+    }
+
+    /// Avis de mise à jour sous la barre d'outils : lien vers la release, ignorer cette version, fermer.
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(r) = self.update_found.clone() else { return };
+        egui::Panel::top("maj").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(tf!("Une nouvelle version est disponible : {0} (installée : {1}).", r.tag, env!("CARGO_PKG_VERSION")));
+                ui.hyperlink_to(t!("Télécharger"), &r.url);
+                if ui.button(t!("Ignorer cette version")).clicked() {
+                    self.settings.update_skip = r.tag.clone();
+                    self.settings.save();
+                    self.update_found = None;
+                }
+                if ui.button(t!("Fermer")).clicked() {
+                    self.update_found = None;
+                }
+            });
+        });
     }
 
     // ---------- Bibliothèque ----------
@@ -861,7 +1007,7 @@ impl App {
                     }
                 }
             }
-            Adjustments { crop: target.crop, angle: target.angle, locals, retouch: target.retouch.clone(), ..clip.clone() }
+            Adjustments { crop: target.crop, angle: target.angle, orient: target.orient, locals, retouch: target.retouch.clone(), ..clip.clone() }
         };
         if self.mode == Mode::Editor {
             self.adj = keep_geometry(&self.adj);
@@ -1229,6 +1375,8 @@ impl App {
             if ui.checkbox(&mut self.settings.start_last, t!("Rouvrir la dernière photo au démarrage")).changed() {
                 self.settings.save();
             }
+            self.update_prefs_ui(ui, ctx);
+            ui.separator();
             self.ai_gpu_ui(ui);
             ui.separator();
             self.engine_prefs_ui(ui, ctx);
@@ -1246,6 +1394,22 @@ impl App {
         if start_bg {
             self.start_bg_masks(ctx);
         }
+    }
+
+    /// Préférences : avis de mise à jour.
+    fn update_prefs_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui.checkbox(&mut self.settings.update_check, t!("Prévenir quand une mise à jour est disponible")).changed() {
+            self.settings.save();
+        }
+        ui.small(tf!("Consulte les releases de {0} sur GitHub, une fois par jour au plus. Rien d'autre n'est envoyé ni téléchargé.", crate::update::REPO));
+        ui.horizontal(|ui| {
+            if ui.add_enabled(self.update_rx.is_none(), egui::Button::new(t!("Vérifier maintenant"))).clicked() {
+                self.start_update_check(ctx, true);
+            }
+            if self.update_rx.is_some() {
+                ui.spinner();
+            }
+        });
     }
 
     /// À propos : version, carte graphique, emplacement des données, licence, informations à copier.
@@ -1826,8 +1990,9 @@ impl App {
     }
 
     fn picked_logo(&mut self, f: PathBuf) {
-        self.settings.export.watermark.image = Some(f);
-        self.settings.export.watermark.kind = crate::watermark::Kind::Image;
+        let wm = if self.logo_for_print { &mut self.settings.print.signature } else { &mut self.settings.export.watermark };
+        wm.image = Some(f);
+        wm.kind = crate::watermark::Kind::Image;
         self.settings.save();
     }
 
@@ -2119,6 +2284,7 @@ impl App {
         let mut pick_logo = false;
         let before = self.settings.export.clone();
         let fmt_before = self.settings.batch_format.clone();
+        let fonts = self.fonts_if(self.settings.export.watermark.kind == crate::watermark::Kind::Text);
         let screen = ctx.content_rect();
         let x = if self.settings.panel_left || batch { screen.right() - 380.0 } else { screen.left() + 12.0 };
         egui::Window::new(t!("Exporter"))
@@ -2180,6 +2346,22 @@ impl App {
                 });
                 ui.small(t!("Une photo plus petite n'est jamais agrandie."));
             }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(t!("Résolution"));
+                for v in [72, 150, 240, 300] {
+                    if ui.selectable_label(o.ppi == v, format!("{v}")).clicked() {
+                        o.ppi = v;
+                    }
+                }
+                ui.add(egui::DragValue::new(&mut o.ppi).range(1..=2400).suffix(format!(" {}", t!("ppp"))));
+            });
+            if let Some((w, h)) = self.size.map(|(w, h)| self.adj.output_size(w, h)) {
+                let k = if o.long_edge > 0 { (o.long_edge as f32 / w.max(h) as f32).min(1.0) } else { 1.0 };
+                let cm = |px: u32| px as f32 * k / o.ppi.max(1) as f32 * 2.54;
+                ui.small(tf!("Notée dans le fichier, sans changer les pixels : tirage de {0} × {1} cm à cette résolution.", format!("{:.1}", cm(w)), format!("{:.1}", cm(h))));
+            } else {
+                ui.small(t!("Notée dans le fichier, sans changer les pixels : taille de tirage proposée aux autres logiciels."));
+            }
             ui.add_space(4.0);
             ui.label(egui::RichText::new(t!("Netteté de sortie")).strong());
             segmented(ui, &mut o.sharpen, &[(export::Sharpen::None, t!("Aucune")), (export::Sharpen::Screen, t!("Écran")), (export::Sharpen::Print, t!("Impression"))]);
@@ -2194,7 +2376,7 @@ impl App {
             ui.add_enabled_ui(o.metadata, |ui| ui.checkbox(&mut o.gps, t!("Avec la position GPS")));
             ui.small(t!("Le profil ICC de l'espace choisi est intégré au fichier (sauf AVIF). Le TIFF ne reçoit pas les EXIF."));
             ui.add_space(4.0);
-            pick_logo = owner_ui(ui, o);
+            pick_logo = owner_ui(ui, o, fonts.as_deref().unwrap_or(&[]));
             ui.separator();
             let label = if batch { tf!("Choisir le dossier et exporter {0} photo(s)…", n) } else { t!("Choisir le fichier et exporter…").to_string() };
             if ui.add_enabled(n > 0 && self.batch.is_none(), egui::Button::new(label)).clicked() {
@@ -2204,8 +2386,12 @@ impl App {
         if self.settings.export != before || self.settings.batch_format != fmt_before {
             self.settings.save();
         }
+        if fonts.is_some() {
+            self.fonts = fonts;
+        }
         self.export_open = open && !go;
         if pick_logo {
+            self.logo_for_print = false;
             self.pick_logo(ctx);
         }
         if go {
@@ -2214,6 +2400,197 @@ impl App {
             } else {
                 self.pick_export_file(ctx);
             }
+        }
+    }
+
+    /// Polices du système (lues une fois), sorties de `self` le temps d'une fenêtre ; rien si `want` est faux.
+    fn fonts_if(&mut self, want: bool) -> Option<Vec<(String, PathBuf)>> {
+        want.then(|| self.fonts.take().unwrap_or_else(crate::watermark::system_fonts))
+    }
+
+    /// Fenêtre Imprimer : imprimante, papier, mise en page avec aperçu, qualité, signature.
+    fn print_window(&mut self, ctx: &egui::Context) {
+        use crate::print::{Layout, Orientation, Paper, Quality};
+        if !self.print_open {
+            return;
+        }
+        let Some(size) = self.size.map(|(w, h)| self.adj.output_size(w, h)) else {
+            self.print_open = false;
+            return;
+        };
+        let (printers, default) = self.printers.get_or_insert_with(crate::print::printers).clone();
+        let before = self.settings.print.clone();
+        let fonts = self.fonts_if(self.settings.print.signature.kind == crate::watermark::Kind::Text);
+        let busy = self.printing.is_some() || self.exporting.is_some();
+        let mut open = true;
+        let (mut go, mut pdf, mut refresh, mut pick_logo) = (false, false, false, false);
+        let screen = ctx.content_rect();
+        let x = if self.settings.panel_left { screen.right() - 380.0 } else { screen.left() + 12.0 };
+        let copyright = self.settings.export.copyright.clone();
+        let export_sig = self.settings.export.watermark.clone();
+        egui::Window::new(t!("Imprimer"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .vscroll(true)
+            .default_height(screen.height() - 120.0)
+            .default_pos(pos2(x, screen.top() + 60.0))
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                let o = &mut self.settings.print;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(t!("Imprimante")).strong());
+                    if ui.small_button(t!("Actualiser")).on_hover_text(t!("Relire la liste des imprimantes")).clicked() {
+                        refresh = true;
+                    }
+                });
+                if printers.is_empty() {
+                    ui.weak(t!("Aucune imprimante trouvée (CUPS). Le PDF reste possible."));
+                } else {
+                    let def = match &default {
+                        Some(d) => tf!("Par défaut ({0})", d.replace('_', " ")),
+                        None => t!("Par défaut").to_string(),
+                    };
+                    let items: Vec<(String, String)> = std::iter::once((String::new(), def)).chain(printers.iter().map(|p| (p.clone(), p.replace('_', " ")))).collect();
+                    choice_list(ui, "imprimante", &mut o.printer, &items);
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(t!("Papier")).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for p in Paper::ALL {
+                        ui.selectable_value(&mut o.paper, p, p.label());
+                    }
+                });
+                ui.label(t!("Orientation"));
+                segmented(ui, &mut o.orientation, &[(Orientation::Auto, t!("Auto")), (Orientation::Portrait, t!("Portrait")), (Orientation::Landscape, t!("Paysage"))]);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(t!("Mise en page")).strong());
+                segmented(ui, &mut o.layout, &[(Layout::Fit, t!("Photo entière")), (Layout::Fill, t!("Remplir la feuille"))]);
+                ui.add_enabled_ui(o.orientation != Orientation::Auto, |ui| {
+                    ui.checkbox(&mut o.rotate_to_fill, t!("Tourner la photo pour remplir"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(t!("Marges"));
+                    ui.add(egui::Slider::new(&mut o.margin, 0.0..=30.0).suffix(" mm"));
+                });
+                print_preview(ui, size, o);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(t!("Qualité")).strong());
+                segmented(ui, &mut o.quality, &[(Quality::Draft, t!("Brouillon")), (Quality::Normal, t!("Normale")), (Quality::High, t!("Haute"))]);
+                segmented(ui, &mut o.gray, &[(false, t!("Couleur")), (true, t!("Niveaux de gris"))]);
+                ui.horizontal(|ui| {
+                    ui.label(t!("Résolution"));
+                    segmented(ui, &mut o.ppi, &[(150, "150"), (300, "300"), (600, "600")]);
+                });
+                ui.checkbox(&mut o.sharpen, t!("Netteté d'impression"));
+                ui.horizontal(|ui| {
+                    ui.label(t!("Copies"));
+                    ui.add(egui::DragValue::new(&mut o.copies).range(1..=99));
+                });
+                ui.small(t!("Couleurs gérées par l'imprimante : la page part en sRGB."));
+                ui.add_space(4.0);
+                pick_logo = signature_ui(ui, "impression", &mut o.signature, &copyright, fonts.as_deref().unwrap_or(&[]));
+                if ui.add_enabled(o.signature != export_sig, egui::Button::new(t!("Reprendre la signature de l'export"))).clicked() {
+                    o.signature = export_sig.clone();
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy && !printers.is_empty(), egui::Button::new(t!("Imprimer"))).clicked() {
+                        go = true;
+                    }
+                    if ui.add_enabled(!busy, egui::Button::new(t!("Enregistrer en PDF…"))).clicked() {
+                        pdf = true;
+                    }
+                });
+            });
+        if fonts.is_some() {
+            self.fonts = fonts;
+        }
+        if self.settings.print != before {
+            self.settings.save();
+        }
+        if refresh {
+            self.printers = None;
+        }
+        self.print_open = open && !go;
+        if pick_logo {
+            self.logo_for_print = true;
+            self.pick_logo(ctx);
+        }
+        if go {
+            self.start_print(None, ctx);
+        }
+        if pdf {
+            let stem = self.path.as_deref().map(library::export_stem).unwrap_or_else(|| "photo".into());
+            let dir = self.path.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+            self.dialog(ctx, move || {
+                let mut d = rfd::FileDialog::new().set_file_name(format!("{stem}.pdf")).add_filter("PDF", &["pdf"]);
+                if let Some(dir) = dir {
+                    d = d.set_directory(dir);
+                }
+                d.save_file().map(Picked::PrintPdf)
+            });
+        }
+    }
+
+    /// Développe la photo en pleine taille, puis l'imprime (`out` vide) ou enregistre la page en PDF.
+    fn start_print(&mut self, out: Option<PathBuf>, ctx: &egui::Context) {
+        let Some(rs) = self.rs.clone() else { return };
+        let renderer = rs.renderer.read();
+        let Some(dev) = renderer.callback_resources.get::<Developer>() else { return };
+        let (w, h, pixels) = match dev.render_full(&rs.device, &rs.queue, &self.adj) {
+            Ok(v) => v,
+            Err(e) => {
+                self.status = tf!("Échec de l'impression : {e:#}", e);
+                return;
+            }
+        };
+        drop(renderer);
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        let opts = self.settings.print.clone();
+        let title = self.path.as_deref().and_then(Path::file_name).map_or_else(|| "Luminux IA".to_string(), |n| n.to_string_lossy().into_owned());
+        self.status = if out.is_some() { t!("Mise en page du PDF…").to_string() } else { t!("Envoi à l'imprimante…").to_string() };
+        std::thread::spawn(move || {
+            let rgb: Vec<f32> = pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+            let r = match out {
+                Some(out) => crate::print::write_pdf(&out, w, h, &rgb, &opts).map(|_| tf!("PDF enregistré : {0}", out.display())),
+                None => crate::print::print(w, h, &rgb, &opts, &title).map(|m| if m.is_empty() { t!("Envoyé à l'imprimante.").to_string() } else { tf!("Envoyé à l'imprimante : {0}", m) }),
+            };
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+        self.printing = Some(rx);
+    }
+
+    /// Signature de la fenêtre Exporter (ou Imprimer) ouverte, posée sur la photo affichée.
+    fn signature_preview(&mut self, ui: &egui::Ui, img_rect: Rect, clip: Rect, (w, h): (u32, u32)) {
+        let wm = if self.export_open {
+            &self.settings.export.watermark
+        } else if self.print_open {
+            &self.settings.print.signature
+        } else {
+            self.sig_preview = None;
+            return;
+        };
+        if wm.kind == crate::watermark::Kind::None {
+            return;
+        }
+        // Calculée à la taille de l'écran (bord long de 2048 px au plus), refaite quand un réglage change.
+        let k = (2048.0 / w.max(h) as f32).min(1.0);
+        let (pw, ph) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+        let key = format!("{pw}x{ph} {}", serde_json::to_string(wm).unwrap_or_default());
+        if self.sig_preview.as_ref().map(|s| &s.0) != Some(&key) {
+            let shown = crate::watermark::overlay(wm, pw, ph).map(|(x, y, rw, rh, px)| {
+                let tex = ui.ctx().load_texture("apercu_signature", egui::ColorImage::from_rgba_unmultiplied([rw, rh], &px), egui::TextureOptions::LINEAR);
+                (tex, Rect::from_min_size(pos2(x as f32 / pw as f32, y as f32 / ph as f32), vec2(rw as f32 / pw as f32, rh as f32 / ph as f32)))
+            });
+            self.sig_preview = Some((key, shown));
+        }
+        if let Some((_, Some((tex, n)))) = &self.sig_preview {
+            let r = Rect::from_min_size(img_rect.min + n.min.to_vec2() * img_rect.size(), n.size() * img_rect.size());
+            ui.painter_at(clip).image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
     }
 
@@ -2757,20 +3134,31 @@ impl App {
         a.vibrance = 0.2;
     }
 
+    /// Rapport largeur/hauteur voulu pour l'image orientée de la photo `w`x`h` ; `None` : libre.
+    fn wanted_ratio(&self, w: f32, h: f32) -> Option<f32> {
+        let (dw, dh) = if self.adj.orient & 1 == 1 { (h, w) } else { (w, h) };
+        let mut ratio = ASPECTS[self.crop_aspect].1;
+        if ratio == 0.0 {
+            return None;
+        }
+        if ratio < 0.0 {
+            ratio = dw / dh;
+            if self.crop_portrait != (dh > dw) {
+                ratio = 1.0 / ratio;
+            }
+        } else if self.crop_portrait {
+            ratio = 1.0 / ratio;
+        }
+        Some(ratio)
+    }
+
     /// Applique le ratio choisi au recadrage actuel, centré, puis supprime les coins vides.
     fn apply_aspect(&mut self) {
         let Some((w, h)) = self.size else { return };
         let (w, h) = (w as f32, h as f32);
-        let mut ratio = ASPECTS[self.crop_aspect].1;
-        if ratio == 0.0 {
-            return;
-        }
-        if ratio < 0.0 {
-            ratio = w / h;
-            if self.crop_portrait != (h > w) {
-                ratio = 1.0 / ratio;
-            }
-        } else if self.crop_portrait {
+        let Some(mut ratio) = self.wanted_ratio(w, h) else { return };
+        // Le rapport voulu est celui de l'image orientée ; le cadre est dans le repère de la source.
+        if self.adj.orient & 1 == 1 {
             ratio = 1.0 / ratio;
         }
         let c = self.adj.crop;
@@ -2812,6 +3200,9 @@ impl App {
         }
         if sc(Modifiers::COMMAND, Key::E) && (self.mode == Mode::Library || self.size.is_some()) {
             self.export_open = true;
+        }
+        if sc(Modifiers::COMMAND, Key::P) && self.mode == Mode::Editor && self.size.is_some() {
+            self.print_open = true;
         }
         if sc(Modifiers::COMMAND | Modifiers::SHIFT, Key::C) {
             self.copy_settings();
@@ -2968,7 +3359,8 @@ impl App {
         };
         let ppp = ui.ctx().pixels_per_point();
         let src = [w as f32, h as f32];
-        let (w, h) = if self.crop_mode { (w, h) } else { self.adj.output_size(w, h) };
+        // Mode recadrage : photo entière, orientée.
+        let (w, h) = if self.crop_mode { if self.adj.orient & 1 == 1 { (h, w) } else { (w, h) } } else { self.adj.output_size(w, h) };
         let img = vec2(w as f32, h as f32);
         // Aperçu de l'agrandissement du cadre : la vue ajustée montre aussi les marges.
         let ex = self.expand_preview();
@@ -3074,6 +3466,10 @@ impl App {
         if resp.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
             self.split_drag = false;
         }
+        if !self.crop_mode && !self.before {
+            let after = if split { Rect::from_min_max(pos2(vis.min.x.max(img_rect.min.x + self.split_pos * img_rect.width()), vis.min.y), vis.max) } else { vis };
+            self.signature_preview(ui, img_rect, after, (w, h));
+        }
         if ex.is_some() {
             let (iw, ih) = (img_rect.width(), img_rect.height());
             let outer = Rect::from_min_max(img_rect.min - vec2(el * iw, et * ih), img_rect.max + vec2(er * iw, eb * ih));
@@ -3084,6 +3480,10 @@ impl App {
             p.rect_filled(Rect::from_min_max(pos2(outer.min.x, img_rect.min.y), pos2(img_rect.min.x, img_rect.max.y)), 0.0, fill);
             p.rect_filled(Rect::from_min_max(pos2(img_rect.max.x, img_rect.min.y), pos2(outer.max.x, img_rect.max.y)), 0.0, fill);
             p.rect_stroke(outer, 0.0, Stroke::new(1.5, Color32::from_rgb(240, 190, 60)), egui::StrokeKind::Outside);
+        }
+        if !self.crop_mode && self.tab == Tab::Crop {
+            // Outil Recadrage ouvert sans cadre actif : la grille de composition reste sur l'image.
+            draw_grid(&ui.painter_at(rect), img_rect, self.crop_grid);
         }
         if self.split_drag {
             // Le rideau prend la souris.
@@ -4446,7 +4846,11 @@ impl App {
     }
 
     fn crop_overlay(&mut self, ui: &egui::Ui, resp: &egui::Response, img_rect: Rect, view: Rect, src: [f32; 2]) {
-        let c = self.adj.crop;
+        // L'image affichée est orientée : le cadre est manipulé dans ce repère, `adj.crop` reste dans celui de la source.
+        let o = self.adj.orient;
+        let sd = if o & 1 == 1 { [src[1], src[0]] } else { src };
+        let inside = |r: [f32; 4], angle: f32| crop_inside(Adjustments::rect_from_display(o, r), angle, src[0], src[1]);
+        let c = Adjustments::rect_to_display(o, self.adj.crop);
         let to_screen = |x: f32, y: f32| pos2(img_rect.left() + x * img_rect.width(), img_rect.top() + y * img_rect.height());
         let cr = Rect::from_min_max(to_screen(c[0], c[1]), to_screen(c[0] + c[2], c[1] + c[3]));
         let corners = [cr.left_top(), cr.right_top(), cr.left_bottom(), cr.right_bottom()];
@@ -4471,8 +4875,8 @@ impl App {
                 CropDrag::Move => {
                     n[0] = (c[0] + d.x).clamp(0.0, 1.0 - c[2]);
                     n[1] = (c[1] + d.y).clamp(0.0, 1.0 - c[3]);
-                    if crop_inside(n, self.adj.angle, src[0], src[1]) {
-                        self.adj.crop = n;
+                    if inside(n, self.adj.angle) {
+                        self.adj.crop = Adjustments::rect_from_display(o, n);
                     }
                 }
                 CropDrag::Corner(i) => {
@@ -4485,17 +4889,17 @@ impl App {
                         // Ratio verrouillé : la hauteur suit la largeur, depuis le coin opposé.
                         let mut ratio = ASPECTS[self.crop_aspect].1;
                         if ratio < 0.0 {
-                            ratio = src[0] / src[1];
-                            if self.crop_portrait != (src[1] > src[0]) { ratio = 1.0 / ratio; }
+                            ratio = sd[0] / sd[1];
+                            if self.crop_portrait != (sd[1] > sd[0]) { ratio = 1.0 / ratio; }
                         } else if self.crop_portrait {
                             ratio = 1.0 / ratio;
                         }
-                        let hh = (x1 - x0) * src[0] / (ratio * src[1]);
+                        let hh = (x1 - x0) * sd[0] / (ratio * sd[1]);
                         if i < 2 { y0 = y1 - hh } else { y1 = y0 + hh }
                     }
                     let nc = [x0, y0, x1 - x0, y1 - y0];
-                    if nc[1] >= 0.0 && nc[1] + nc[3] <= 1.0 && crop_inside(nc, self.adj.angle, src[0], src[1]) {
-                        self.adj.crop = nc;
+                    if nc[1] >= 0.0 && nc[1] + nc[3] <= 1.0 && inside(nc, self.adj.angle) {
+                        self.adj.crop = Adjustments::rect_from_display(o, nc);
                     }
                 }
             }
@@ -4508,12 +4912,7 @@ impl App {
         p.rect_filled(Rect::from_min_max(pos2(ir.left(), cr.bottom()), ir.right_bottom()), 0.0, shade);
         p.rect_filled(Rect::from_min_max(pos2(ir.left(), cr.top()), pos2(cr.left(), cr.bottom())), 0.0, shade);
         p.rect_filled(Rect::from_min_max(pos2(cr.right(), cr.top()), pos2(ir.right(), cr.bottom())), 0.0, shade);
-        let thin = Stroke::new(1.0, Color32::from_white_alpha(110));
-        for k in 1..3 {
-            let t = k as f32 / 3.0;
-            p.line_segment([pos2(cr.left() + t * cr.width(), cr.top()), pos2(cr.left() + t * cr.width(), cr.bottom())], thin);
-            p.line_segment([pos2(cr.left(), cr.top() + t * cr.height()), pos2(cr.right(), cr.top() + t * cr.height())], thin);
-        }
+        draw_grid(&p, cr, self.crop_grid);
         p.rect_stroke(cr, 0.0, Stroke::new(1.5, Color32::WHITE), egui::StrokeKind::Middle);
         for k in corners {
             p.rect_filled(Rect::from_center_size(k, vec2(10.0, 10.0)), 2.0, Color32::WHITE);
@@ -4711,13 +5110,17 @@ impl App {
     }
 
     fn crop_ui(&mut self, ui: &mut egui::Ui) {
+                ui.small(t!("Glisse les coins ou l'intérieur du cadre sur la photo. Entrée valide le cadre."));
                 ui.horizontal(|ui| {
-                    if ui.toggle_value(&mut self.crop_mode, t!("Recadrer")).on_hover_text(t!("Touche C, Entrée pour valider")).changed() {
+                    let label = if self.crop_mode { t!("Terminer le cadrage") } else { t!("Modifier le cadre") };
+                    if ui.button(label).on_hover_text(t!("Touche C ou Entrée")).clicked() {
+                        self.crop_mode = !self.crop_mode;
                         self.fit = true;
                     }
                     if ui.button(t!("Réinitialiser")).clicked() {
                         self.adj.crop = [0.0, 0.0, 1.0, 1.0];
                         self.adj.angle = 0.0;
+                        self.adj.orient = 0;
                     }
                 });
                 let before = (self.crop_aspect, self.crop_portrait);
@@ -4739,7 +5142,133 @@ impl App {
                         self.adj.crop = fit_crop(self.adj.crop, self.adj.angle, w as f32, h as f32);
                     }
                 }
-                    ui.small(t!("Glisse les poignées sur l'image. Entrée ou Échap : terminer. Touche C : recadrer."));
+                ui.add_space(4.0);
+                ui.label(t!("Orientation"));
+                self.orient_ui(ui);
+                ui.add_space(4.0);
+                if ui.button(t!("Redressement automatique")).on_hover_text(t!("Cherche les lignes dominantes (horizon, verticales) et corrige l'inclinaison.")).clicked() {
+                    self.auto_straighten();
+                }
+                ui.add_space(6.0);
+                ui.label(t!("Cadrages suggérés"));
+                self.crop_suggest_ui(ui);
+                ui.add_space(6.0);
+                ui.label(t!("Grille de composition"));
+                let mut g = self.crop_grid;
+                for row in GRIDS.chunks(3).enumerate() {
+                    let options: Vec<(usize, &str)> = row.1.iter().enumerate().map(|(j, n)| (row.0 * 3 + j, crate::i18n::tr(n))).collect();
+                    segmented(ui, &mut g, &options);
+                }
+                self.crop_grid = g;
+    }
+
+    /// Rotations de 90° et miroirs de l'image recadrée ; le cadre suit l'orientation.
+    fn orient_ui(&mut self, ui: &mut egui::Ui) {
+        type Op = fn([f32; 2]) -> [f32; 2];
+        let ops: [(&str, Op); 4] = [
+            (t!("Rotation à gauche"), |p| [1.0 - p[1], p[0]]),
+            (t!("Rotation à droite"), |p| [p[1], 1.0 - p[0]]),
+            (t!("Miroir horizontal"), |p| [1.0 - p[0], p[1]]),
+            (t!("Miroir vertical"), |p| [p[0], 1.0 - p[1]]),
+        ];
+        let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+        for pair in ops.chunks(2) {
+            ui.horizontal(|ui| {
+                for (label, op) in pair {
+                    if ui.add(egui::Button::new(*label).min_size(vec2(w, 26.0))).clicked() {
+                        self.adj.orient = Adjustments::orient_after(self.adj.orient, op);
+                        self.fit = true;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Rend la photo entière (sans recadrage) au redressement `angle`, à `max` pixels : (pixels sRGB, largeur, hauteur).
+    fn render_full_frame(&self, angle: f32, orient: u8, max: u32) -> Option<(Vec<[f32; 4]>, usize, usize)> {
+        let rs = self.rs.clone()?;
+        let renderer = rs.renderer.read();
+        let dev = renderer.callback_resources.get::<Developer>()?;
+        let base = Adjustments { angle, orient, ..Default::default() };
+        let (w, h) = small_size(&Adjustments { orient, ..Default::default() }, dev.width, dev.height, max);
+        let u = base.uniforms([0.0, 0.0, 1.0, 1.0], false, false, [dev.width as f32, dev.height as f32], true);
+        let px = dev.render_to_cpu(&rs.device, &rs.queue, &u, w, h).ok()?;
+        Some((px, w as usize, h as usize))
+    }
+
+    /// Redressement automatique : mesure l'inclinaison des lignes dominantes et la corrige.
+    fn auto_straighten(&mut self) {
+        let Some((px, w, h)) = self.render_full_frame(0.0, 0, 640) else { return };
+        let lum: Vec<f32> = px.iter().map(|p| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]).collect();
+        match crate::composition::detect_tilt(&lum, w, h) {
+            Some(d) => {
+                self.adj.angle = (-d).clamp(-45.0, 45.0);
+                if let Some((sw, sh)) = self.size {
+                    self.adj.crop = fit_crop(self.adj.crop, self.adj.angle, sw as f32, sh as f32);
+                }
+                self.status = tf!("Redressement automatique : {0:.1}°", self.adj.angle);
+            }
+            None => self.status = t!("Aucune ligne dominante : redressement inchangé.").into(),
+        }
+    }
+
+    /// Prépare la vignette et le point d'intérêt (à refaire si la photo ou le redressement change).
+    fn crop_suggest_refresh(&mut self, ui: &egui::Ui) {
+        let key = (self.path.clone(), self.size, self.adj.angle.to_bits(), self.adj.orient);
+        if self.crop_sug.as_ref().is_some_and(|s| s.key == key) {
+            return;
+        }
+        // Pas de nouveau rendu pendant qu'un curseur est tiré.
+        if self.crop_sug.is_some() && ui.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let Some((px, w, h)) = self.render_full_frame(self.adj.angle, self.adj.orient, 360) else { return };
+        let subject = crate::composition::interest_point(&px, w, h);
+        let rgba: Vec<u8> = px.iter().flat_map(|p| [p[0], p[1], p[2], 1.0].map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8)).collect();
+        let tex = ui.ctx().load_texture("cadrages", egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba), egui::TextureOptions::LINEAR);
+        self.crop_sug = Some(CropSuggest { key, tex, subject });
+    }
+
+    /// Cadrages suggérés autour du point d'intérêt, au format choisi : un clic applique le cadre.
+    fn crop_suggest_ui(&mut self, ui: &mut egui::Ui) {
+        self.crop_suggest_refresh(ui);
+        let (Some(sug), Some((w, h))) = (&self.crop_sug, self.size) else { return };
+        let (w, h) = (w as f32, h as f32);
+        // Cadrages dans le repère de l'image orientée (celui de la vignette), convertis au clic.
+        let o = self.adj.orient;
+        let (dw, dh) = if o & 1 == 1 { (h, w) } else { (w, h) };
+        let list = crate::composition::candidates(sug.subject, self.wanted_ratio(w, h).unwrap_or(0.0), dw, dh);
+        let current = Adjustments::rect_to_display(o, self.adj.crop);
+        let sp = ui.spacing().item_spacing;
+        let cell = vec2((ui.available_width() - sp.x) / 2.0, 92.0);
+        let mut pick = None;
+        for row in list.chunks(2).enumerate() {
+            ui.horizontal(|ui| {
+                for (j, cand) in row.1.iter().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(cell, Sense::click());
+                    let p = ui.painter_at(rect);
+                    let on = cand.rect.iter().zip(&current).all(|(a, b)| (a - b).abs() < 0.01);
+                    p.rect_filled(rect, 8.0, if on { palette::ITEM_ON } else if resp.hovered() { palette::ITEM } else { palette::WINDOW });
+                    // Vignette : la zone du cadrage dans la vignette de la photo redressée.
+                    let aspect = cand.rect[2] * dw / (cand.rect[3] * dh);
+                    let avail = vec2(cell.x - 12.0, cell.y - 26.0);
+                    let size = if avail.x / avail.y > aspect { vec2(avail.y * aspect, avail.y) } else { vec2(avail.x, avail.x / aspect) };
+                    let img = Rect::from_center_size(rect.center_top() + vec2(0.0, 6.0 + avail.y / 2.0), size);
+                    let uv = Rect::from_min_size(pos2(cand.rect[0], cand.rect[1]), vec2(cand.rect[2], cand.rect[3]));
+                    p.image(sug.tex.id(), img, uv, Color32::WHITE);
+                    if on {
+                        p.rect_stroke(rect.shrink(0.5), 8.0, Stroke::new(1.5, Color32::from_rgb(240, 175, 50)), egui::StrokeKind::Inside);
+                    }
+                    p.text(rect.center_bottom() - vec2(0.0, 10.0), egui::Align2::CENTER_CENTER, crate::i18n::tr(cand.name), egui::FontId::proportional(12.0), Color32::from_gray(210));
+                    if resp.clicked() {
+                        pick = Some(row.0 * 2 + j);
+                    }
+                }
+            });
+        }
+        if let Some(i) = pick {
+            self.adj.crop = fit_crop(Adjustments::rect_from_display(o, list[i].rect), self.adj.angle, w, h);
+        }
     }
 
     /// Réglages globaux en accordéon : une section ouverte à la fois, sauf les sections épinglées.
@@ -5621,10 +6150,8 @@ fn paint_stars(p: &egui::Painter, top_left: Pos2, rating: u8, size: f32) {
 // choice_list), pas par liste déroulante. La liste déroulante est réservée aux listes longues ou qui grandissent
 // (objectifs de la base Lensfun, packs de looks, plus de 8 modèles).
 
-/// Auteur, copyright et filigrane de la fenêtre Exporter. Renvoie vrai pour choisir un logo.
-fn owner_ui(ui: &mut egui::Ui, o: &mut export::Options) -> bool {
-    use crate::watermark::{Kind, Place};
-    let mut pick = false;
+/// Auteur, copyright et signature de la fenêtre Exporter. Renvoie vrai pour choisir un logo.
+fn owner_ui(ui: &mut egui::Ui, o: &mut export::Options, fonts: &[(String, PathBuf)]) -> bool {
     ui.label(egui::RichText::new(t!("Auteur et copyright")).strong());
     egui::Grid::new("auteur").num_columns(2).show(ui, |ui| {
         ui.label(t!("Auteur"));
@@ -5636,19 +6163,47 @@ fn owner_ui(ui: &mut egui::Ui, o: &mut export::Options) -> bool {
     });
     ui.small(t!("Écrits dans les EXIF de chaque photo exportée, même sans « Garder les métadonnées »."));
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(t!("Filigrane")).strong());
-    let wm = &mut o.watermark;
-    segmented(ui, &mut wm.kind, &[(Kind::None, t!("Aucun")), (Kind::Text, t!("Texte")), (Kind::Image, t!("Logo"))]);
+    signature_ui(ui, "export", &mut o.watermark, &o.copyright, fonts)
+}
+
+/// Signature posée sur la photo (export et impression) : texte ou logo, place, taille, couleur, police,
+/// ombre, fusion. Renvoie vrai pour choisir un logo.
+fn signature_ui(ui: &mut egui::Ui, id: &str, wm: &mut crate::watermark::Watermark, copyright: &str, fonts: &[(String, PathBuf)]) -> bool {
+    use crate::watermark::{Blend, Kind, Place};
+    let mut pick = false;
+    ui.label(egui::RichText::new(t!("Signature")).strong());
+    segmented(ui, &mut wm.kind, &[(Kind::None, t!("Aucune")), (Kind::Text, t!("Texte")), (Kind::Image, t!("Logo"))]);
     match wm.kind {
         Kind::None => return false,
         Kind::Text => {
             ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut wm.text).hint_text(t!("Texte du filigrane")).desired_width(200.0));
-                if ui.add_enabled(!o.copyright.trim().is_empty(), egui::Button::new(t!("Copyright|reprendre"))).on_hover_text(t!("Reprendre le copyright")).clicked() {
-                    wm.text = o.copyright.trim().to_string();
+                ui.add(egui::TextEdit::singleline(&mut wm.text).hint_text(t!("Texte de la signature")).desired_width(200.0));
+                if ui.add_enabled(!copyright.trim().is_empty(), egui::Button::new(t!("Copyright|reprendre"))).on_hover_text(t!("Reprendre le copyright")).clicked() {
+                    wm.text = copyright.trim().to_string();
                 }
             });
-            segmented(ui, &mut wm.white, &[(true, t!("Blanc")), (false, t!("Noir"))]);
+            ui.horizontal(|ui| {
+                ui.label(t!("Couleur"));
+                let mut c = wm.text_color();
+                if ui.color_edit_button_rgb(&mut c).changed() {
+                    wm.color = Some(c);
+                }
+                for (v, label) in [([1.0f32; 3], t!("Blanc")), ([0.0; 3], t!("Noir"))] {
+                    if ui.selectable_label(wm.text_color() == v, label).clicked() {
+                        wm.color = Some(v);
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(t!("Police"));
+                let shown = wm.font.as_ref().map_or(t!("Intégrée (Ubuntu Light)").to_string(), |f| fonts.iter().find(|x| x.1 == *f).map_or_else(|| f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), |x| x.0.clone()));
+                egui::ComboBox::from_id_salt((id, "police")).width(ui.available_width() - 8.0).selected_text(shown).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut wm.font, None, t!("Intégrée (Ubuntu Light)"));
+                    for (name, path) in fonts {
+                        ui.selectable_value(&mut wm.font, Some(path.clone()), name);
+                    }
+                });
+            });
         }
         Kind::Image => {
             ui.horizontal(|ui| {
@@ -5662,30 +6217,78 @@ fn owner_ui(ui: &mut egui::Ui, o: &mut export::Options) -> bool {
             });
         }
     }
-    ui.horizontal_wrapped(|ui| {
-        for (v, label) in [
-            (Place::TopLeft, t!("Haut gauche")),
-            (Place::TopRight, t!("Haut droite")),
-            (Place::Center, t!("Centre")),
-            (Place::BottomLeft, t!("Bas gauche")),
-            (Place::BottomRight, t!("Bas droite")),
-        ] {
-            ui.selectable_value(&mut wm.place, v, label);
+    ui.horizontal(|ui| {
+        ui.label(t!("Position"));
+        // Grille 3 × 3 : chaque case est une place, la case pleine est celle choisie.
+        let (area, _) = ui.allocate_exact_size(vec2(3.0 * 34.0, 3.0 * 22.0), Sense::hover());
+        for (i, p) in Place::GRID.iter().enumerate() {
+            let cell = Rect::from_min_size(area.min + vec2((i % 3) as f32 * 34.0, (i / 3) as f32 * 22.0), vec2(31.0, 19.0));
+            let r = ui.interact(cell, ui.id().with((id, "place", i)), Sense::click());
+            let v = ui.visuals();
+            let fill = if wm.place == *p { v.selection.bg_fill } else if r.hovered() { v.widgets.hovered.bg_fill } else { v.widgets.inactive.bg_fill };
+            ui.painter().rect_filled(cell, 3.0, fill);
+            if r.clicked() {
+                wm.place = *p;
+            }
         }
     });
-    let mut width = wm.width * 100.0;
-    ui.horizontal(|ui| {
-        ui.label(t!("Largeur"));
-        ui.add(egui::Slider::new(&mut width, 5.0..=60.0).suffix(" %"));
+    let pct = |ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>| {
+        let mut x = *v * 100.0;
+        ui.label(label);
+        ui.add(egui::Slider::new(&mut x, range).suffix(" %"));
+        ui.end_row();
+        *v = x / 100.0;
+    };
+    egui::Grid::new((id, "reglages")).num_columns(2).show(ui, |ui| {
+        pct(ui, t!("Taille"), &mut wm.width, 5.0..=60.0);
+        pct(ui, t!("Opacité"), &mut wm.opacity, 10.0..=100.0);
+        pct(ui, t!("Ombre"), &mut wm.shadow, 0.0..=100.0);
+        pct(ui, t!("Retrait horizontal"), &mut wm.inset_h, 0.0..=20.0);
+        pct(ui, t!("Retrait vertical"), &mut wm.inset_v, 0.0..=20.0);
     });
-    wm.width = width / 100.0;
-    let mut op = wm.opacity * 100.0;
-    ui.horizontal(|ui| {
-        ui.label(t!("Opacité"));
-        ui.add(egui::Slider::new(&mut op, 10.0..=100.0).suffix(" %"));
+    ui.label(t!("Fusion"));
+    segmented(ui, &mut wm.blend, &[(Blend::Normal, t!("Normale")), (Blend::Multiply, t!("Produit")), (Blend::Screen, t!("Superposition")), (Blend::Overlay, t!("Incrustation"))]);
+    ui.small(match wm.blend {
+        Blend::Normal => t!("La signature couvre la photo."),
+        Blend::Multiply => t!("Assombrit : le blanc disparaît (logo sur fond blanc)."),
+        Blend::Screen => t!("Éclaircit : le noir disparaît."),
+        Blend::Overlay => t!("Se fond dans la photo en renforçant son contraste."),
     });
-    wm.opacity = op / 100.0;
+    ui.small(t!("Aperçu sur la photo tant que la fenêtre est ouverte (sans le mode de fusion)."));
     pick
+}
+
+/// Aperçu de la feuille : place de la photo, partie rognée, taille du tirage et résolution effective.
+fn print_preview(ui: &mut egui::Ui, (iw, ih): (u32, u32), o: &crate::print::Options) {
+    let p = crate::print::place(iw, ih, o);
+    let k = 150.0 / p.page.0.max(p.page.1);
+    let (resp, painter) = ui.allocate_painter(vec2(ui.available_width(), 160.0), egui::Sense::hover());
+    let page = egui::Rect::from_center_size(resp.rect.center(), vec2(p.page.0 * k, p.page.1 * k));
+    painter.rect_filled(page.translate(vec2(3.0, 3.0)), 2.0, Color32::from_black_alpha(80));
+    painter.rect_filled(page, 2.0, Color32::WHITE);
+    let photo = egui::Rect::from_min_size(page.min + vec2(p.dest[0] * k, p.dest[1] * k), vec2(p.dest[2] * k, p.dest[3] * k));
+    painter.rect_filled(photo, 0.0, Color32::from_rgb(70, 110, 150));
+    // Signature : petit repère à sa place.
+    if o.signature.kind != crate::watermark::Kind::None {
+        let i = crate::watermark::Place::GRID.iter().position(|q| *q == o.signature.place).unwrap_or(8);
+        let (cx, cy) = ((i % 3) as f32 / 2.0, (i / 3) as f32 / 2.0);
+        let s = vec2(photo.width() * o.signature.width.clamp(0.05, 0.6), 4.0);
+        let at = photo.min + vec2(4.0 + cx * (photo.width() - s.x - 8.0), 4.0 + cy * (photo.height() - s.y - 8.0));
+        painter.rect_filled(egui::Rect::from_min_size(at, s), 1.0, Color32::from_white_alpha(200));
+    }
+    if p.rotate {
+        painter.text(photo.center(), egui::Align2::CENTER_CENTER, "90°", egui::FontId::proportional(14.0), Color32::WHITE);
+    }
+    // Résolution effective : pixels de la photo réellement imprimés par pouce.
+    let sw = if p.rotate { ih } else { iw };
+    let ppi = (sw as f32 * p.src[2]) / (p.dest[2] / 25.4);
+    ui.small(tf!("Tirage {0} × {1} cm, {2} ppp effectifs.", format!("{:.1}", p.dest[2] / 10.0), format!("{:.1}", p.dest[3] / 10.0), format!("{:.0}", ppi)));
+    if ppi < 150.0 {
+        ui.colored_label(Color32::from_rgb(220, 150, 60), t!("Résolution faible pour ce format : le tirage risque d'être flou."));
+    }
+    if o.layout == crate::print::Layout::Fill && (p.src[2] < 0.995 || p.src[3] < 0.995) {
+        ui.small(tf!("{0} % de la photo est rogné pour remplir.", format!("{:.0}", (1.0 - p.src[2] * p.src[3]) * 100.0)));
+    }
 }
 
 /// Choix exclusif : boutons de même largeur sur toute la largeur disponible.
@@ -5768,6 +6371,48 @@ fn negative_toggle(text: &str, terms: &str, on: bool) -> String {
 }
 
 /// Formats de recadrage en tuiles dessinées (rectangle aux proportions du format).
+/// Grille de composition `kind` (index dans GRIDS) sur le cadre `cr`.
+fn draw_grid(p: &egui::Painter, cr: Rect, kind: usize) {
+    let thin = Stroke::new(1.0, Color32::from_white_alpha(110));
+    let at = |fx: f32, fy: f32| pos2(cr.left() + fx * cr.width(), cr.top() + fy * cr.height());
+    let line = |a: Pos2, b: Pos2| p.line_segment([a, b], thin);
+    match GRIDS.get(kind).copied() {
+        Some("Tiers") => {
+            for k in 1..3 {
+                let t = k as f32 / 3.0;
+                line(at(t, 0.0), at(t, 1.0));
+                line(at(0.0, t), at(1.0, t));
+            }
+        }
+        Some("Diagonales") => {
+            line(at(0.0, 0.0), at(1.0, 1.0));
+            line(at(1.0, 0.0), at(0.0, 1.0));
+            line(at(0.5, 0.0), at(0.5, 1.0));
+            line(at(0.0, 0.5), at(1.0, 0.5));
+        }
+        Some("Triangle d'or") => {
+            // Diagonale et perpendiculaires abaissées depuis les deux autres coins.
+            let (a, b) = (cr.left_top(), cr.right_bottom());
+            line(a, b);
+            let d = b - a;
+            for corner in [cr.right_top(), cr.left_bottom()] {
+                let t = (corner - a).dot(d) / d.dot(d);
+                line(corner, a + d * t);
+            }
+        }
+        Some("Spirale d'or") => {
+            let pts: Vec<Pos2> = crate::composition::golden_spiral().iter().map(|q| at(q[0], q[1])).collect();
+            p.add(egui::Shape::line(pts, thin));
+        }
+        Some("Centre") => {
+            line(at(0.5, 0.0), at(0.5, 1.0));
+            line(at(0.0, 0.5), at(1.0, 0.5));
+            p.circle_stroke(at(0.5, 0.5), 5.0, thin);
+        }
+        _ => {}
+    }
+}
+
 fn ratio_tiles(ui: &mut egui::Ui, sel: &mut usize, portrait: bool) {
     let cols = 4;
     let sp = ui.spacing().item_spacing.x;
@@ -5979,6 +6624,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let rs = frame.wgpu_render_state().cloned();
         self.looks_visible = false;
+        self.poll_update_check();
 
         if let Some(rx) = &self.loading {
             if let Ok(r) = rx.try_recv() {
@@ -5992,7 +6638,7 @@ impl eframe::App for App {
         if let Some(bg) = &self.bg_masks {
             use std::sync::atomic::Ordering;
             // Le travail interactif passe avant.
-            let busy = self.loading.is_some() || self.ai_job.is_some() || self.erase_job.is_some() || self.exporting.is_some() || self.batch.is_some();
+            let busy = self.loading.is_some() || self.ai_job.is_some() || self.erase_job.is_some() || self.exporting.is_some() || self.printing.is_some() || self.batch.is_some();
             bg.pause.store(busy, Ordering::Release);
             if bg.done.load(Ordering::Acquire) >= bg.total {
                 self.bg_masks = None;
@@ -6022,6 +6668,15 @@ impl eframe::App for App {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.file_job = None,
                 Err(_) => ctx.request_repaint_after(std::time::Duration::from_millis(300)),
+            }
+        }
+        if let Some(rx) = &self.printing {
+            if let Ok(r) = rx.try_recv() {
+                self.printing = None;
+                self.status = match r {
+                    Ok(m) => m,
+                    Err(e) => tf!("Échec de l'impression : {e:#}", e),
+                };
             }
         }
         if let Some(rx) = &self.exporting {
@@ -6281,6 +6936,7 @@ impl eframe::App for App {
                                 self.export_cutout(out, rs, &ctx);
                             }
                         }
+                        Picked::PrintPdf(out) => self.start_print(Some(out.with_extension("pdf")), &ctx),
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.picking = None,
@@ -6331,7 +6987,9 @@ impl eframe::App for App {
         }
         self.new_doc_window(&ctx);
         self.prefs_window(&ctx);
+        self.update_window(&ctx);
         self.export_window(&ctx);
+        self.print_window(&ctx);
         self.help_windows(&ctx);
         self.trash_window(&ctx);
         self.layer_picker_window(&ctx);
@@ -6356,6 +7014,7 @@ impl eframe::App for App {
 
         egui::Panel::top("menus").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("barre").show(ui, |ui| self.toolbar(ui));
+        self.update_banner(ui);
         egui::Panel::bottom("etat").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.loading.is_some() || self.exporting.is_some() {

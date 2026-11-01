@@ -357,6 +357,9 @@ pub struct Adjustments {
     pub crop: [f32; 4],
     /// Redressement en degrés (sens horaire positif).
     pub angle: f32,
+    /// Orientation de l'image recadrée : bits 0-1 = quarts de tour horaires, bit 2 = miroir horizontal
+    /// (appliqué après la rotation).
+    pub orient: u8,
     /// Netteté 0..1.
     pub sharpen: f32,
     /// Réduction du bruit de luminance et de couleur, 0..1.
@@ -415,6 +418,7 @@ impl Default for Adjustments {
             hsl: [HslBand::default(); 8],
             crop: [0.0, 0.0, 1.0, 1.0],
             angle: 0.0,
+            orient: 0,
             sharpen: 0.0,
             nr_luma: 0.0,
             nr_color: 0.0,
@@ -545,7 +549,59 @@ pub fn tint_offset(hue_deg: f32, sat: f32) -> [f32; 4] {
 impl Adjustments {
     /// Taille de l'image produite (après recadrage) pour une source `w`x`h`.
     pub fn output_size(&self, w: u32, h: u32) -> (u32, u32) {
-        (((self.crop[2] * w as f32).round() as u32).max(1), ((self.crop[3] * h as f32).round() as u32).max(1))
+        let (cw, ch) = (((self.crop[2] * w as f32).round() as u32).max(1), ((self.crop[3] * h as f32).round() as u32).max(1));
+        if self.orient & 1 == 1 { (ch, cw) } else { (cw, ch) }
+    }
+
+    /// Image de sortie (0..1) -> image recadrée avant orientation (0..1).
+    /// Même calcul que `orient_uv` dans le shader.
+    pub fn orient_fwd(o: u8, uv: [f32; 2]) -> [f32; 2] {
+        let [mut u, v] = uv;
+        if o & 4 != 0 {
+            u = 1.0 - u;
+        }
+        match o & 3 {
+            1 => [v, 1.0 - u],
+            2 => [1.0 - u, 1.0 - v],
+            3 => [1.0 - v, u],
+            _ => [u, v],
+        }
+    }
+
+    /// Inverse de `orient_fwd`.
+    pub fn orient_inv(o: u8, p: [f32; 2]) -> [f32; 2] {
+        let [u, v] = match o & 3 {
+            1 => [1.0 - p[1], p[0]],
+            2 => [1.0 - p[0], 1.0 - p[1]],
+            3 => [p[1], 1.0 - p[0]],
+            _ => p,
+        };
+        if o & 4 != 0 { [1.0 - u, v] } else { [u, v] }
+    }
+
+    /// Rectangle (x, y, l, h) de l'image recadrée avant orientation -> même zone dans l'image orientée.
+    pub fn rect_to_display(o: u8, r: [f32; 4]) -> [f32; 4] {
+        let (a, b) = (Self::orient_inv(o, [r[0], r[1]]), Self::orient_inv(o, [r[0] + r[2], r[1] + r[3]]));
+        [a[0].min(b[0]), a[1].min(b[1]), (a[0] - b[0]).abs(), (a[1] - b[1]).abs()]
+    }
+
+    /// Inverse de `rect_to_display`.
+    pub fn rect_from_display(o: u8, r: [f32; 4]) -> [f32; 4] {
+        let (a, b) = (Self::orient_fwd(o, [r[0], r[1]]), Self::orient_fwd(o, [r[0] + r[2], r[1] + r[3]]));
+        [a[0].min(b[0]), a[1].min(b[1]), (a[0] - b[0]).abs(), (a[1] - b[1]).abs()]
+    }
+
+    /// Orientation obtenue en appliquant `op` (carte de la nouvelle image vers l'ancienne) à l'orientation `o`.
+    pub fn orient_after(o: u8, op: impl Fn([f32; 2]) -> [f32; 2]) -> u8 {
+        let probes = [[0.2f32, 0.3], [0.7, 0.1]];
+        (0..8u8)
+            .find(|&n| {
+                probes.iter().all(|&p| {
+                    let (a, b) = (Self::orient_fwd(n, p), Self::orient_fwd(o, op(p)));
+                    (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4
+                })
+            })
+            .unwrap_or(o)
     }
 
     /// `src` = taille de la source en pixels ; `full_frame` ignore le recadrage (mode recadrage).
@@ -562,7 +618,7 @@ impl Adjustments {
             uv_rect,
             wb,
             tone: [self.contrast, self.highlights, self.shadows, self.whites],
-            tone2: [self.blacks, self.saturation, self.vibrance, 0.0],
+            tone2: [self.blacks, self.saturation, self.vibrance, self.orient as f32],
             misc: [before as u32 as f32, lod0 as u32 as f32, self.vignette, self.vignette_mid],
             crop: if full_frame { [0.0, 0.0, 1.0, 1.0] } else { self.crop },
             geo: [self.angle.to_radians(), src[0], src[1], 0.0],
@@ -664,6 +720,7 @@ impl Adjustments {
         Adjustments {
             crop: self.crop,
             angle: self.angle,
+            orient: self.orient,
             nr_luma: self.nr_luma,
             nr_color: self.nr_color,
             locals: self.locals.clone(),
@@ -682,6 +739,7 @@ impl Adjustments {
     /// Même calcul que `geo_map` dans le shader.
     pub fn out_to_src(&self, uv: [f32; 2], src: [f32; 2], full_frame: bool) -> [f32; 2] {
         let c = if full_frame { [0.0, 0.0, 1.0, 1.0] } else { self.crop };
+        let uv = Self::orient_fwd(self.orient, uv);
         let (s, co) = self.angle.to_radians().sin_cos();
         let p = [(c[0] + uv[0] * c[2]) * src[0] - src[0] * 0.5, (c[1] + uv[1] * c[3]) * src[1] - src[1] * 0.5];
         let q = [co * p[0] + s * p[1], -s * p[0] + co * p[1]];
@@ -694,7 +752,8 @@ impl Adjustments {
         let (s, co) = self.angle.to_radians().sin_cos();
         let q = [uv[0] * src[0] - src[0] * 0.5, uv[1] * src[1] - src[1] * 0.5];
         let p = [co * q[0] - s * q[1], s * q[0] + co * q[1]];
-        [((p[0] + src[0] * 0.5) / src[0] - c[0]) / c[2], ((p[1] + src[1] * 0.5) / src[1] - c[1]) / c[3]]
+        let out = [((p[0] + src[0] * 0.5) / src[0] - c[0]) / c[2], ((p[1] + src[1] * 0.5) / src[1] - c[1]) / c[3]];
+        Self::orient_inv(self.orient, out)
     }
 
     /// Courbe échantillonnée sur 256 valeurs (interpolation cubique monotone).
@@ -857,5 +916,48 @@ mod tests {
             assert!(y >= prev - 1e-6);
             prev = y;
         }
+    }
+
+    #[test]
+    fn orientation_maps_are_inverse_and_swap_the_size() {
+        for o in 0..8u8 {
+            for p in [[0.2f32, 0.3], [0.9, 0.6]] {
+                let q = Adjustments::orient_inv(o, Adjustments::orient_fwd(o, p));
+                assert!((q[0] - p[0]).abs() < 1e-5 && (q[1] - p[1]).abs() < 1e-5, "{o} {p:?} {q:?}");
+            }
+            let a = Adjustments { orient: o, crop: [0.0, 0.0, 0.5, 1.0], ..Default::default() };
+            assert_eq!(a.output_size(400, 300), if o & 1 == 1 { (300, 200) } else { (200, 300) });
+            for r in [[0.1f32, 0.2, 0.5, 0.3], [0.0, 0.0, 1.0, 1.0]] {
+                let back = Adjustments::rect_from_display(o, Adjustments::rect_to_display(o, r));
+                assert!(back.iter().zip(&r).all(|(a, b)| (a - b).abs() < 1e-5), "{o} {r:?} {back:?}");
+            }
+            // Sortie -> source -> sortie, avec recadrage et redressement.
+            let a = Adjustments { orient: o, crop: [0.1, 0.1, 0.6, 0.7], angle: 3.0, ..Default::default() };
+            let src = [400.0, 300.0];
+            let p = [0.3, 0.8];
+            let r = a.src_to_out(a.out_to_src(p, src, false), src, false);
+            assert!((r[0] - p[0]).abs() < 1e-4 && (r[1] - p[1]).abs() < 1e-4, "{o} {r:?}");
+        }
+    }
+
+    #[test]
+    fn orientation_operations_compose_like_a_dihedral_group() {
+        let right: fn([f32; 2]) -> [f32; 2] = |p| [p[1], 1.0 - p[0]];
+        let left: fn([f32; 2]) -> [f32; 2] = |p| [1.0 - p[1], p[0]];
+        let flip: fn([f32; 2]) -> [f32; 2] = |p| [1.0 - p[0], p[1]];
+        let flip_v: fn([f32; 2]) -> [f32; 2] = |p| [p[0], 1.0 - p[1]];
+        let mut o = 0;
+        for _ in 0..4 {
+            o = Adjustments::orient_after(o, right);
+        }
+        assert_eq!(o, 0);
+        assert_eq!(Adjustments::orient_after(Adjustments::orient_after(0, right), left), 0);
+        assert_eq!(Adjustments::orient_after(Adjustments::orient_after(0, flip), flip), 0);
+        // Miroir vertical = demi-tour puis miroir horizontal.
+        assert_eq!(Adjustments::orient_after(0, flip_v), 2 | 4);
+        // Un quart de tour à droite met le coin haut-gauche en haut à droite.
+        let a = Adjustments { orient: Adjustments::orient_after(0, right), ..Default::default() };
+        let tl = a.out_to_src([1.0, 0.0], [100.0, 100.0], false);
+        assert!(tl[0].abs() < 1e-5 && tl[1].abs() < 1e-5, "{tl:?}");
     }
 }

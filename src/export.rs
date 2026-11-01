@@ -43,11 +43,14 @@ pub struct Options {
     /// PNG et TIFF en 16 bits par couche (sinon 8) : utile pour un RAW ou une retouche ailleurs,
     /// mais le fichier pèse le double.
     pub deep: bool,
+    /// Résolution notée dans le fichier (points par pouce) : ne change pas les pixels, seulement la taille
+    /// d'impression proposée par les autres logiciels.
+    pub ppi: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { space: Space::Srgb, long_edge: 0, sharpen: Sharpen::None, quality: 92, metadata: true, gps: true, author: String::new(), copyright: String::new(), watermark: Default::default(), deep: false }
+        Self { space: Space::Srgb, long_edge: 0, sharpen: Sharpen::None, quality: 92, metadata: true, gps: true, author: String::new(), copyright: String::new(), watermark: Default::default(), deep: false, ppi: 300 }
     }
 }
 
@@ -176,7 +179,7 @@ fn resize(w: u32, h: u32, rgb: Vec<f32>, long_edge: u32) -> (u32, u32, Vec<f32>)
 }
 
 /// Netteté de sortie (masque flou) : légère pour l'écran, plus marquée pour l'impression.
-fn sharpen(w: u32, h: u32, rgb: &mut [f32], kind: Sharpen) {
+pub(crate) fn sharpen(w: u32, h: u32, rgb: &mut [f32], kind: Sharpen) {
     let (sigma, amount) = match kind {
         Sharpen::None => return,
         Sharpen::Screen => (0.6, 0.5),
@@ -205,7 +208,8 @@ fn convert(rgb: &mut Vec<f32>, space: Space) -> Result<()> {
 
 /// EXIF de la photo d'origine, adaptés à l'image exportée (taille, orientation, espace couleur), en TIFF brut.
 /// `src` absent : seulement l'auteur et le copyright, s'ils sont remplis.
-pub fn exif_for(src: Option<&Path>, w: u32, h: u32, space: Space, gps: bool, author: &str, copyright: &str) -> Option<Vec<u8>> {
+#[allow(clippy::too_many_arguments)]
+pub fn exif_for(src: Option<&Path>, w: u32, h: u32, space: Space, gps: bool, author: &str, copyright: &str, ppi: u32) -> Option<Vec<u8>> {
     use exif::{Field, In, Tag, Value};
     let src = src.map(crate::library::source);
     let read = src.as_ref().and_then(|src| std::fs::File::open(src).ok()).and_then(|f| exif::Reader::new().read_from_container(&mut std::io::BufReader::new(f)).ok());
@@ -230,6 +234,9 @@ pub fn exif_for(src: Option<&Path>, w: u32, h: u32, space: Space, gps: bool, aut
         Tag::ComponentsConfiguration,
         Tag::CompressedBitsPerPixel,
         Tag::InteroperabilityIndex,
+        Tag::XResolution,
+        Tag::YResolution,
+        Tag::ResolutionUnit,
     ];
     let mut fields: Vec<Field> = match &read {
         Some(e) => e
@@ -251,6 +258,10 @@ pub fn exif_for(src: Option<&Path>, w: u32, h: u32, space: Space, gps: bool, aut
         return None;
     }
     fields.push(field(Tag::Orientation, Value::Short(vec![1])));
+    let res = Value::Rational(vec![exif::Rational { num: ppi.clamp(1, 10000), denom: 1 }]);
+    fields.push(field(Tag::XResolution, res.clone()));
+    fields.push(field(Tag::YResolution, res));
+    fields.push(field(Tag::ResolutionUnit, Value::Short(vec![2])));
     fields.push(field(Tag::PixelXDimension, Value::Long(vec![w])));
     fields.push(field(Tag::PixelYDimension, Value::Long(vec![h])));
     // 1 = sRGB, 0xFFFF = autre (le profil ICC fait foi).
@@ -286,6 +297,9 @@ pub fn exif_for(src: Option<&Path>, w: u32, h: u32, space: Space, gps: bool, aut
             Tag::Artist,
             Tag::Copyright,
             Tag::Orientation,
+            Tag::XResolution,
+            Tag::YResolution,
+            Tag::ResolutionUnit,
             Tag::PixelXDimension,
             Tag::PixelYDimension,
             Tag::ColorSpace,
@@ -366,7 +380,7 @@ pub fn write(out: &Path, src: Option<&Path>, width: u32, height: u32, rgba: &[[f
     convert(&mut rgb, space).context("conversion de l'espace couleur")?;
     let icc = icc(space);
     crate::watermark::apply(&opts.watermark, w, h, &mut rgb);
-    let exif = exif_for(if opts.metadata { src } else { None }, w, h, space, opts.gps, &opts.author, &opts.copyright);
+    let exif = exif_for(if opts.metadata { src } else { None }, w, h, space, opts.gps, &opts.author, &opts.copyright, opts.ppi);
     let file = std::io::BufWriter::new(std::fs::File::create(out).with_context(|| format!("création de {}", out.display()))?);
     match ext.as_str() {
         "jpg" | "jpeg" => {
@@ -376,16 +390,20 @@ pub fn write(out: &Path, src: Option<&Path>, width: u32, height: u32, rgba: &[[f
             if let Some(x) = exif {
                 let _ = enc.set_exif_metadata(x);
             }
+            enc.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(opts.ppi.clamp(1, 65535) as u16));
             enc.write_image(&data, w, h, image::ExtendedColorType::Rgb8)?;
         }
         "png" => {
             let (data, ty) = samples(&rgb, opts.deep);
-            let mut enc = image::codecs::png::PngEncoder::new(file);
+            let mut png = Vec::new();
+            let mut enc = image::codecs::png::PngEncoder::new(&mut png);
             let _ = enc.set_icc_profile(icc);
             if let Some(x) = exif {
                 let _ = enc.set_exif_metadata(x);
             }
             enc.write_image(&data, w, h, ty)?;
+            let mut file = file;
+            file.write_all(&with_phys(&png, opts.ppi))?;
         }
         "webp" => {
             let data: Vec<u8> = rgb.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
@@ -410,6 +428,28 @@ pub fn write(out: &Path, src: Option<&Path>, width: u32, height: u32, rgba: &[[f
         }
     }
     Ok(())
+}
+
+/// Ajoute au PNG la résolution (bloc pHYs, juste après l'en-tête IHDR).
+fn with_phys(png: &[u8], ppi: u32) -> Vec<u8> {
+    // Signature (8) puis IHDR : longueur, type, 13 octets, CRC.
+    let at = 8 + 4 + 4 + 13 + 4;
+    if png.len() < at || &png[12..16] != b"IHDR" {
+        return png.to_vec();
+    }
+    let ppm = (ppi as f64 / 0.0254).round() as u32;
+    let mut body = b"pHYs".to_vec();
+    body.extend_from_slice(&ppm.to_be_bytes());
+    body.extend_from_slice(&ppm.to_be_bytes());
+    body.push(1);
+    let mut crc = flate2::Crc::new();
+    crc.update(&body);
+    let mut out = png[..at].to_vec();
+    out.extend_from_slice(&9u32.to_be_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc.sum().to_be_bytes());
+    out.extend_from_slice(&png[at..]);
+    out
 }
 
 /// Valeurs 0..1 en octets de 8 ou 16 bits par couche, avec le type d'image à écrire.
@@ -539,6 +579,29 @@ mod tests {
         let img = image::open(&out).unwrap();
         assert_eq!(img.color(), image::ColorType::Rgb8);
         assert_eq!(img.to_rgb8().get_pixel(1, 1).0, [51, 128, 204]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolution_is_written() {
+        let dir = std::env::temp_dir().join(format!("luminux_ppi_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let px = vec![[0.2f32, 0.5, 0.8, 1.0]; 4];
+        let opts = Options { ppi: 240, ..Default::default() };
+        // PNG : bloc pHYs valide (le décodeur vérifie son CRC), 240 ppp = 9449 points par mètre.
+        let out = dir.join("t.png");
+        write(&out, None, 2, 2, &px, &opts).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let at = bytes.windows(4).position(|w| w == b"pHYs").unwrap();
+        assert_eq!(u32::from_be_bytes(bytes[at + 4..at + 8].try_into().unwrap()), 9449);
+        assert_eq!(image::open(&out).unwrap().to_rgb8().get_pixel(1, 1).0, [51, 128, 204]);
+        // JPEG : densité JFIF en points par pouce.
+        let out = dir.join("t.jpg");
+        write(&out, None, 2, 2, &px, &opts).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let at = bytes.windows(5).position(|w| w == b"JFIF\0").unwrap();
+        assert_eq!(bytes[at + 7], 1);
+        assert_eq!(u16::from_be_bytes([bytes[at + 8], bytes[at + 9]]), 240);
         std::fs::remove_dir_all(&dir).ok();
     }
 

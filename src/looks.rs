@@ -625,7 +625,7 @@ pub const USER_CATEGORY: &str = k!("Mes looks");
 /// propres à chaque photo). Un look du même nom est remplacé.
 pub fn save_user_look(name: &str, adj: &Adjustments) -> Result<()> {
     let d = Adjustments::default();
-    let adjustments = Adjustments { crop: d.crop, angle: d.angle, nr_luma: d.nr_luma, nr_color: d.nr_color, locals: vec![], sky: d.sky.clone(), lens: d.lens.clone(), retouch: vec![], depth: d.depth.clone(), ..adj.clone() };
+    let adjustments = Adjustments { crop: d.crop, angle: d.angle, orient: d.orient, nr_luma: d.nr_luma, nr_color: d.nr_color, locals: vec![], sky: d.sky.clone(), lens: d.lens.clone(), retouch: vec![], depth: d.depth.clone(), ..adj.clone() };
     let mut look = Look {
         name: name.trim().to_string(),
         category: USER_CATEGORY.into(),

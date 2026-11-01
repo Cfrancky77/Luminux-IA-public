@@ -42,6 +42,8 @@ pub struct Settings {
     pub split_layout: bool,
     /// Options d'export (espace couleur, taille, netteté, qualité, métadonnées).
     pub export: crate::export::Options,
+    /// Options d'impression (imprimante, papier, mise en page, signature).
+    pub print: crate::print::Options,
     /// Accessibilité : taille de l'interface (1 = 100 %), contraste élevé, grandes zones de clic.
     pub ui_zoom: f32,
     pub high_contrast: bool,
@@ -58,6 +60,11 @@ pub struct Settings {
     pub local_model: String,
     /// Modèle d'agrandissement local (`local:…`) ; vide : le modèle conseillé.
     pub local_upscale: String,
+    /// Prévenir qu'une version plus récente existe (une requête GitHub par jour au plus).
+    pub update_check: bool,
+    /// Date (secondes Unix) de la dernière vérification, et version dont l'avis est ignoré.
+    pub update_last: u64,
+    pub update_skip: String,
 }
 
 impl Default for Settings {
@@ -81,6 +88,7 @@ impl Default for Settings {
             panel_left: false,
             split_layout: false,
             export: Default::default(),
+            print: Default::default(),
             ui_zoom: 1.0,
             high_contrast: false,
             large_targets: false,
@@ -90,6 +98,9 @@ impl Default for Settings {
             ai_local: false,
             local_model: String::new(),
             local_upscale: String::new(),
+            update_check: false,
+            update_last: 0,
+            update_skip: String::new(),
             ollama_url: "http://127.0.0.1:11434".into(),
         }
     }

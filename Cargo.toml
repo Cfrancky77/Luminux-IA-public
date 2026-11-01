@@ -1,6 +1,6 @@
 [package]
 name = "luminux"
-version = "0.33.2"
+version = "0.37.1"
 edition = "2024"
 
 [dependencies]
