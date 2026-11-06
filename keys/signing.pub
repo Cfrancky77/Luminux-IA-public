@@ -1,0 +1,3 @@
+# Clés publiques Ed25519 (une par ligne, en base64, 32 octets) qui signent les AppImage du catalogue.
+# Les lignes qui commencent par # sont ignorées. À remplir avec la clé publique de Franck (voir SECURITY.md).
+Ot1vRLolXbnpLFMzv41+dC0psovuqV4gIebBYbeS5Bg=

@@ -2,6 +2,15 @@
 
 Éditeur photo non destructif, rendu GPU (wgpu / Vulkan).
 
+## Windows (version portable)
+
+Chaque release contient aussi `Luminux_IA-windows-x64.zip` (Windows 10/11, 64 bits). Rien à installer :
+décompresser le dossier où l'on veut et lancer « Luminux IA.exe » (garder les .dll à côté, elles servent à
+l'IA). L'application n'est pas signée : au premier lancement, SmartScreen affiche « éditeur inconnu »
+(« Informations complémentaires », puis « Exécuter quand même »). Réglages, catalogue et modèles :
+`%LOCALAPPDATA%\luminux`. Différences : « Imprimer » ouvre la page en PDF dans le lecteur PDF (choix de
+l'imprimante là-bas), la corbeille est celle de Windows. Construction : `bash packaging/build-windows.sh`.
+
 ## Compiler et lancer
 
     cargo build --release
@@ -15,7 +24,7 @@ Export sans fenêtre (utilise les réglages du fichier .luminux) :
 
 ## Bibliothèque
 
-- « Ajouter un dossier… » : le dossier et ses sous-dossiers sont parcourus (RAW, JPEG, PNG, TIFF, WebP).
+- « Ajouter un dossier… » : le dossier et ses sous-dossiers sont parcourus (RAW, JPEG, PNG, TIFF, WebP), sauf les dossiers cachés (`.cache`, `.local`…). Pendant le parcours, « Arrêter » en bas de la fenêtre l'interrompt (les photos déjà trouvées restent). Un dossier ajouté par erreur se retire par clic droit, même pendant le parcours.
   Au démarrage, les dossiers sont re-parcourus : nouvelles photos ajoutées, photos supprimées retirées.
 - Colonne Dossiers : chaque dossier affiche son nombre de photos ; la flèche déplie ses sous-dossiers, et un clic sur un sous-dossier n'affiche que ses photos (sous-dossiers compris). « Toutes les photos » donne le total de la bibliothèque.
 - « Actualiser » (menu Bibliothèque) relit les dossiers (photos ajoutées, modifiées ou supprimées). C'est aussi fait tout seul au retour dans l'application (après au moins une minute) et toutes les 15 minutes. Un dossier absent (disque ou partage réseau non monté) garde ses photos dans la bibliothèque au lieu de les perdre.

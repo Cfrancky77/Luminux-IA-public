@@ -109,6 +109,14 @@ pub fn system_fonts() -> Vec<(String, PathBuf)> {
     if let Some(d) = dirs::font_dir() {
         dirs.push(d);
     }
+    #[cfg(windows)]
+    {
+        let win = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        dirs.push(win.join("Fonts"));
+        if let Some(l) = dirs::data_local_dir() {
+            dirs.push(l.join(r"Microsoft\Windows\Fonts"));
+        }
+    }
     let mut out: Vec<(String, PathBuf)> = dirs
         .iter()
         .flat_map(|d| walkdir::WalkDir::new(d).follow_links(true).max_depth(6).into_iter().flatten())

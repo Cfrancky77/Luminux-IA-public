@@ -1,0 +1,15 @@
+Luminux IA pour Windows (version portable)
+==========================================
+
+Rien à installer : décompresse le dossier où tu veux (Documents, clé USB…) et lance « Luminux IA.exe ».
+Garde les fichiers .dll à côté du .exe : ils servent aux outils IA (sujet, ciel, gomme…).
+
+Au premier lancement, Windows SmartScreen peut afficher « éditeur inconnu » (l'application n'est pas
+signée) : « Informations complémentaires » puis « Exécuter quand même ».
+
+Réglages, catalogue et modèles IA : %LOCALAPPDATA%\luminux
+Mode d'emploi complet : LISEZMOI.md sur la page du projet.
+
+Particularités Windows :
+- « Imprimer » ouvre la page en PDF dans ton lecteur PDF, d'où tu choisis l'imprimante.
+- « Mettre à la corbeille » utilise la Corbeille de Windows.

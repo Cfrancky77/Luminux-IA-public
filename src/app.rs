@@ -402,6 +402,8 @@ pub struct App {
     grid_cols: usize,
     scroll_to_sel: bool,
     scanning: Option<Receiver<ScanMsg>>,
+    /// Interrompt le scan en cours (bouton « Arrêter », retrait d'un dossier).
+    scan_stop: Arc<std::sync::atomic::AtomicBool>,
     scan_count: usize,
     scan_listed: usize,
     thumbs: Option<Thumbnailer>,
@@ -650,6 +652,7 @@ impl App {
             grid_cols: 1,
             scroll_to_sel: false,
             scanning: None,
+            scan_stop: Default::default(),
             scan_count: 0,
             scan_listed: 0,
             thumbs: None,
@@ -924,7 +927,9 @@ impl App {
         self.last_scan = Some(std::time::Instant::now());
         let (tx, rx) = channel();
         let (folders, ctx) = (self.folders.clone(), ctx.clone());
-        std::thread::spawn(move || library::scan(folders, tx, ctx));
+        self.scan_stop = Default::default();
+        let stop = self.scan_stop.clone();
+        std::thread::spawn(move || library::scan(folders, tx, ctx, stop));
         self.scanning = Some(rx);
         self.scan_count = 0;
         self.scan_listed = 0;
@@ -1321,7 +1326,11 @@ impl App {
         }
         if let Some(f) = remove {
             if let Some(cat) = &self.catalogue {
-                let _ = cat.remove_folder(&f);
+                // Le scan en cours écrit par lots : le retrait passe entre deux lots, et le scan
+                // abandonne ce dossier dès qu'il voit qu'il n'est plus suivi.
+                if let Err(e) = cat.remove_folder(&f) {
+                    self.status = tf!("Impossible de retirer le dossier : {e:#}", e);
+                }
                 self.folders = cat.folders();
             }
             self.refresh_dirs();
@@ -2445,7 +2454,9 @@ impl App {
                         refresh = true;
                     }
                 });
-                if printers.is_empty() {
+                if crate::print::VIA_PDF_READER {
+                    ui.weak(t!("Sous Windows, « Imprimer » ouvre la page en PDF dans ton lecteur, d'où tu choisis l'imprimante."));
+                } else if printers.is_empty() {
                     ui.weak(t!("Aucune imprimante trouvée (CUPS). Le PDF reste possible."));
                 } else {
                     let def = match &default {
@@ -2496,7 +2507,7 @@ impl App {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(!busy && !printers.is_empty(), egui::Button::new(t!("Imprimer"))).clicked() {
+                    if ui.add_enabled(!busy && (!printers.is_empty() || crate::print::VIA_PDF_READER), egui::Button::new(t!("Imprimer"))).clicked() {
                         go = true;
                     }
                     if ui.add_enabled(!busy, egui::Button::new(t!("Enregistrer en PDF…"))).clicked() {
@@ -2556,7 +2567,15 @@ impl App {
             let rgb: Vec<f32> = pixels.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
             let r = match out {
                 Some(out) => crate::print::write_pdf(&out, w, h, &rgb, &opts).map(|_| tf!("PDF enregistré : {0}", out.display())),
-                None => crate::print::print(w, h, &rgb, &opts, &title).map(|m| if m.is_empty() { t!("Envoyé à l'imprimante.").to_string() } else { tf!("Envoyé à l'imprimante : {0}", m) }),
+                None => crate::print::print(w, h, &rgb, &opts, &title).map(|m| {
+                    if crate::print::VIA_PDF_READER {
+                        t!("PDF ouvert dans le lecteur : imprime depuis celui-ci.").to_string()
+                    } else if m.is_empty() {
+                        t!("Envoyé à l'imprimante.").to_string()
+                    } else {
+                        tf!("Envoyé à l'imprimante : {0}", m)
+                    }
+                }),
             };
             let _ = tx.send(r);
             ctx.request_repaint();
@@ -4777,7 +4796,7 @@ impl App {
                 self.dialog(ctx, || rfd::FileDialog::new().add_filter(t!("Images"), sky::SKY_EXTS).pick_files().map(Picked::Skies));
             }
             if ui.button(t!("Dossier")).on_hover_text(sky::skies_dir().display().to_string()).clicked() {
-                let _ = std::process::Command::new("xdg-open").arg(sky::skies_dir()).spawn();
+                crate::platform::open_dir(&sky::skies_dir());
             }
             if ui.add_enabled(self.adj.sky.image.is_some(), egui::Button::new(t!("Aucun"))).clicked() {
                 self.adj.sky.image = None;
@@ -6866,6 +6885,10 @@ impl eframe::App for App {
                         self.scan_count = n;
                         done = true;
                     }
+                    ScanMsg::Stopped => {
+                        self.status = t!("Scan arrêté. Menu Bibliothèque, Actualiser pour le reprendre.").into();
+                        done = true;
+                    }
                     ScanMsg::Error(e) => {
                         self.status = tf!("Erreur de scan : {e}", e);
                         done = true;
@@ -7033,6 +7056,10 @@ impl eframe::App for App {
                     if self.scanning.is_some() {
                         ui.spinner();
                         ui.label(tf!("scan : {0} fichiers", self.scan_count));
+                        let stopping = self.scan_stop.load(std::sync::atomic::Ordering::Relaxed);
+                        if ui.add_enabled(!stopping, egui::Button::new(t!("Arrêter")).small()).on_hover_text(t!("Arrête le parcours des dossiers ; les photos déjà trouvées restent.")).clicked() {
+                            self.scan_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                     let pending = self.thumbs.as_ref().map_or(0, |t| t.pending());
                     if pending > 0 {

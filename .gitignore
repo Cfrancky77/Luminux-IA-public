@@ -1,3 +1,7 @@
 /target/
 *.AppImage
 *.AppDir/
+packaging/winwheel/
+packaging/Luminux IA/
+Luminux_IA-windows-x64.zip
+*.sig

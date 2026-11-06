@@ -15,7 +15,12 @@ pub const PREFIX: &str = "local:";
 
 /// Version de stable-diffusion.cpp utilisée (binaires officiels Linux Vulkan, Ubuntu 24.04).
 const VERSION: &str = "master-987-a77d362";
+#[cfg(not(windows))]
 const ENGINE_URL: &str = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-987-a77d362/sd-master-a77d362-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip";
+#[cfg(windows)]
+const ENGINE_URL: &str = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-987-a77d362/sd-master-a77d362-bin-win-vulkan-x64.zip";
+/// Nom du programme dans l'archive.
+const SD_CLI: &str = if cfg!(windows) { "sd-cli.exe" } else { "sd-cli" };
 
 /// Fichier à télécharger : nom, adresse, taille annoncée (Mo).
 pub struct Asset {
@@ -57,7 +62,7 @@ fn engine_dir() -> PathBuf {
 
 /// Programme `sd-cli` : `LUMINUX_SD` le remplace (essais, version compilée soi-même).
 pub fn engine() -> PathBuf {
-    std::env::var_os("LUMINUX_SD").map(PathBuf::from).unwrap_or_else(|| engine_dir().join("sd-cli"))
+    std::env::var_os("LUMINUX_SD").map(PathBuf::from).unwrap_or_else(|| engine_dir().join(SD_CLI))
 }
 
 pub fn engine_ready() -> bool {
@@ -119,10 +124,13 @@ pub fn install(a: &Asset, progress: &Progress) -> Result<()> {
         }
         let out = tmp.join(&name);
         std::io::copy(&mut f, &mut std::fs::File::create(&out)?)?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755))?;
+        }
     }
-    if !tmp.join("sd-cli").is_file() {
+    if !tmp.join(SD_CLI).is_file() {
         bail!("archive du moteur sans sd-cli");
     }
     let _ = std::fs::remove_dir_all(engine_dir());
@@ -163,7 +171,7 @@ fn run(args: &[std::ffi::OsString]) -> Result<()> {
         bail!("moteur local non installé (Préférences, IA)");
     }
     // L'AppImage règle LD_LIBRARY_PATH pour ses propres bibliothèques : le moteur a les siennes à côté de lui.
-    let out = Command::new(&exe).args(args).env_remove("LD_LIBRARY_PATH").output().with_context(|| format!("lancement de {}", exe.display()))?;
+    let out = crate::platform::no_console(&mut Command::new(&exe)).args(args).env_remove("LD_LIBRARY_PATH").output().with_context(|| format!("lancement de {}", exe.display()))?;
     if out.status.success() {
         return Ok(());
     }

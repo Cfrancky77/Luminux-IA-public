@@ -288,6 +288,8 @@ fn ort_candidates() -> Vec<PathBuf> {
         v.push(dir.join("../lib/libonnxruntime.so.1"));
         v.push(dir.join("../lib/libonnxruntime.so"));
         v.push(dir.join("libonnxruntime.so"));
+        // Windows : onnxruntime.dll (avec dxil/dxcompiler pour WebGPU via Direct3D 12) à côté du .exe.
+        v.push(dir.join("onnxruntime.dll"));
     }
     v.push(crate::library::data_dir().join("lib/libonnxruntime.so"));
     for d in ["/usr/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu"] {
@@ -300,7 +302,7 @@ static ORT: OnceLock<std::result::Result<ort::environment::Environment, String>>
 
 fn ensure_ort() -> Result<()> {
     let r = ORT.get_or_init(|| {
-        let lib = ort_candidates().into_iter().find(|p| p.is_file()).ok_or_else(|| "libonnxruntime.so introuvable (fournie dans l'AppImage)".to_string())?;
+        let lib = ort_candidates().into_iter().find(|p| p.is_file()).ok_or_else(|| "ONNX Runtime introuvable (libonnxruntime.so dans l'AppImage, onnxruntime.dll à côté du .exe)".to_string())?;
         ort::init_from(&lib).map_err(|e| format!("{}: {e}", lib.display()))?.with_name("luminux").build().map_err(|e| e.to_string())
     });
     r.as_ref().map(|_| ()).map_err(|e| anyhow!("ONNX Runtime : {e}"))

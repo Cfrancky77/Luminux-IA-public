@@ -11,6 +11,7 @@ use rusqlite::{Connection, params};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::UNIX_EPOCH;
 
@@ -58,6 +59,9 @@ pub fn virtual_copy(p: &Path, n: u32) -> PathBuf {
 /// Montre le fichier dans le gestionnaire de fichiers (sélectionné si possible), sinon ouvre son dossier.
 pub fn show_in_folder(p: &Path) {
     let file = source(p);
+    if crate::platform::select_in_explorer(&file) {
+        return;
+    }
     std::thread::spawn(move || {
         let mut uri = String::from("file://");
         for b in file.as_os_str().as_encoded_bytes() {
@@ -86,7 +90,7 @@ pub fn show_in_folder(p: &Path) {
             .is_ok_and(|s| s.success());
         if !shown {
             if let Some(dir) = file.parent() {
-                let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+                crate::platform::open_dir(dir);
             }
         }
     });
@@ -239,6 +243,11 @@ impl Catalogue {
     }
 
     /// Retire le dossier du catalogue (les fichiers ne sont pas touchés).
+    /// Le dossier est-il encore dans la bibliothèque ?
+    pub fn follows(&self, path: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT EXISTS(SELECT 1 FROM folders WHERE path = ?1)", [path], |r| r.get(0))?)
+    }
+
     pub fn remove_folder(&self, path: &str) -> Result<()> {
         self.conn.execute("DELETE FROM folders WHERE path = ?1", [path])?;
         self.conn.execute("DELETE FROM photos WHERE folder = ?1", [path])?;
@@ -435,14 +444,26 @@ impl Catalogue {
 pub enum ScanMsg {
     Progress(usize),
     Done(usize),
+    /// Arrêté à la demande : ce qui a été lu est gardé, rien n'est retiré du catalogue.
+    Stopped,
     Error(String),
 }
 
+/// Dossier caché (`.cache`, `.local`, `.thumbnails`…) : icônes et vignettes d'applications, pas des photos.
+fn hidden(e: &walkdir::DirEntry) -> bool {
+    e.depth() > 0 && e.file_name().to_string_lossy().starts_with('.')
+}
+
 /// Parcourt les dossiers, ajoute les nouvelles photos, met à jour les modifiées,
-/// retire celles qui ont disparu. Tourne dans son propre thread.
-pub fn scan(folders: Vec<String>, tx: Sender<ScanMsg>, ctx: egui::Context) {
-    let run = || -> Result<usize> {
-        let cat = Catalogue::open()?;
+/// retire celles qui ont disparu. Tourne dans son propre thread ; `stop` l'interrompt.
+/// Écrit par lots (le catalogue reste modifiable pendant un long scan : note, retrait d'un dossier…).
+pub fn scan(folders: Vec<String>, tx: Sender<ScanMsg>, ctx: egui::Context, stop: Arc<AtomicBool>) {
+    scan_with(Catalogue::open, folders, tx, ctx, stop)
+}
+
+fn scan_with(open: impl Fn() -> Result<Catalogue>, folders: Vec<String>, tx: Sender<ScanMsg>, ctx: egui::Context, stop: Arc<AtomicBool>) {
+    let run = || -> Result<Option<usize>> {
+        let cat = open()?;
         let mut seen = 0;
         for folder in &folders {
             // Dossier absent (disque ou partage réseau non monté) : ses photos restent au catalogue.
@@ -454,8 +475,14 @@ pub fn scan(folders: Vec<String>, tx: Sender<ScanMsg>, ctx: egui::Context) {
                 st.query_map([folder], |r| Ok((r.get(0)?, r.get(1)?)))?.filter_map(|r| r.ok()).collect()
             };
             let mut present = HashSet::new();
-            let tx_batch = cat.conn.unchecked_transaction()?;
-            for entry in walkdir::WalkDir::new(folder).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+            cat.conn.execute_batch("BEGIN")?;
+            let mut batch = std::time::Instant::now();
+            let walk = walkdir::WalkDir::new(folder).follow_links(true).into_iter().filter_entry(|e| !hidden(e));
+            for entry in walk.filter_map(|e| e.ok()) {
+                if stop.load(Ordering::Relaxed) {
+                    cat.conn.execute_batch("COMMIT")?;
+                    return Ok(None);
+                }
                 let p = entry.path();
                 if !entry.file_type().is_file() || !is_image(p) {
                     continue;
@@ -467,7 +494,7 @@ pub fn scan(folders: Vec<String>, tx: Sender<ScanMsg>, ctx: egui::Context) {
                     cat.set_edited(p, is_edited(p));
                 } else {
                     let (taken, camera) = read_meta(p);
-                    tx_batch.execute(
+                    cat.conn.execute(
                         "INSERT INTO photos(path, folder, name, mtime, taken, camera, edited)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                          ON CONFLICT(path) DO UPDATE SET mtime = ?4, taken = ?5, camera = ?6, edited = ?7",
@@ -487,6 +514,20 @@ pub fn scan(folders: Vec<String>, tx: Sender<ScanMsg>, ctx: egui::Context) {
                     let _ = tx.send(ScanMsg::Progress(seen));
                     ctx.request_repaint();
                 }
+                // Lots courts : le verrou d'écriture n'est jamais gardé plus de quelques dixièmes de seconde.
+                if batch.elapsed().as_millis() >= 300 {
+                    cat.conn.execute_batch("COMMIT; BEGIN")?;
+                    batch = std::time::Instant::now();
+                    if !cat.follows(folder)? {
+                        break;
+                    }
+                }
+            }
+            // Dossier retiré de la bibliothèque pendant le parcours : ne pas le remettre.
+            if !cat.follows(folder)? {
+                cat.conn.execute("DELETE FROM photos WHERE folder = ?1", [folder])?;
+                cat.conn.execute_batch("COMMIT")?;
+                continue;
             }
             // Une copie virtuelle reste tant que sa photo est là.
             let gone = |k: &String| {
@@ -494,18 +535,19 @@ pub fn scan(folders: Vec<String>, tx: Sender<ScanMsg>, ctx: egui::Context) {
                 !present.contains(&src)
             };
             for k in known.keys().filter(|k| gone(k)) {
-                tx_batch.execute("DELETE FROM photos WHERE path = ?1", [k])?;
-                tx_batch.execute("DELETE FROM keywords WHERE path = ?1", [k])?;
+                cat.conn.execute("DELETE FROM photos WHERE path = ?1", [k])?;
+                cat.conn.execute("DELETE FROM keywords WHERE path = ?1", [k])?;
             }
             for k in known.keys().filter(|k| copy_number(Path::new(k.as_str())).is_some() && !gone(k)) {
                 cat.set_edited(Path::new(k.as_str()), is_edited(Path::new(k.as_str())));
             }
-            tx_batch.commit()?;
+            cat.conn.execute_batch("COMMIT")?;
         }
-        Ok(seen)
+        Ok(Some(seen))
     };
     let _ = tx.send(match run() {
-        Ok(n) => ScanMsg::Done(n),
+        Ok(Some(n)) => ScanMsg::Done(n),
+        Ok(None) => ScanMsg::Stopped,
         Err(e) => ScanMsg::Error(format!("{e:#}")),
     });
     ctx.request_repaint();
@@ -698,6 +740,7 @@ pub fn matches(query: &str, photo: &Photo, keywords: &[String]) -> bool {
 // ---------- Corbeille ----------
 
 /// Corbeille de l'utilisateur (freedesktop) : $XDG_DATA_HOME/Trash.
+#[cfg_attr(windows, allow(dead_code))]
 fn trash_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("Trash")
 }
@@ -705,9 +748,13 @@ fn trash_dir() -> PathBuf {
 /// Met un fichier à la corbeille du bureau (spécification freedesktop.org), d'où le gestionnaire de
 /// fichiers peut le restaurer. Sur un autre disque (NAS, clé), le fichier y est copié puis effacé.
 pub fn trash(p: &Path) -> Result<()> {
+    #[cfg(windows)]
+    return trash::delete(p).with_context(|| format!("mise à la corbeille de {}", p.display()));
+    #[cfg(not(windows))]
     trash_into(&trash_dir(), p)
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn trash_into(dir: &Path, p: &Path) -> Result<()> {
     let p = std::path::absolute(p)?;
     anyhow::ensure!(p.is_file(), "{} introuvable", p.display());
@@ -757,6 +804,7 @@ fn trash_into(dir: &Path, p: &Path) -> Result<()> {
 }
 
 /// Date et heure locales au format AAAA-MM-JJTHH:MM:SS (heure locale via `date`, UTC à défaut).
+#[cfg_attr(windows, allow(dead_code))]
 fn local_now() -> String {
     if let Ok(o) = std::process::Command::new("date").arg("+%Y-%m-%dT%H:%M:%S").output() {
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -978,6 +1026,71 @@ impl Thumbnailer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_skips_hidden_folders_stops_and_drops_removed_folders() {
+        let dir = std::env::temp_dir().join(format!("luminux-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let photos = dir.join("photos");
+        std::fs::create_dir_all(photos.join(".cache/thumbnails")).unwrap();
+        std::fs::create_dir_all(photos.join("2024")).unwrap();
+        let png = image::RgbImage::new(2, 2);
+        for p in ["a.png", "2024/b.png", ".cache/thumbnails/c.png"] {
+            png.save(photos.join(p)).unwrap();
+        }
+        let db = dir.join("catalogue.db");
+        let open = || Catalogue::with(Connection::open(&db)?);
+        let f = photos.to_string_lossy().to_string();
+        let run = |stop: bool| {
+            let (tx, rx) = channel();
+            scan_with(open, vec![f.clone()], tx, egui::Context::default(), Arc::new(AtomicBool::new(stop)));
+            rx.try_iter().last().unwrap()
+        };
+        let count = || open().unwrap().conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get::<_, i64>(0)).unwrap();
+        open().unwrap().add_folder(&f).unwrap();
+        // Arrêt demandé : rien n'est lu, rien n'est perdu.
+        assert!(matches!(run(true), ScanMsg::Stopped));
+        assert_eq!(count(), 0);
+        // Dossier caché ignoré.
+        assert!(matches!(run(false), ScanMsg::Done(2)));
+        assert_eq!(count(), 2);
+        // Dossier retiré de la bibliothèque (pendant un scan) : ses photos ne reviennent pas.
+        open().unwrap().conn.execute("DELETE FROM folders", []).unwrap();
+        assert!(matches!(run(false), ScanMsg::Done(_)));
+        assert_eq!(count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn folder_can_be_removed_during_a_long_scan() {
+        let dir = std::env::temp_dir().join(format!("luminux-scan-long-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let photos = dir.join("home");
+        std::fs::create_dir_all(&photos).unwrap();
+        let mut buf = Vec::new();
+        image::RgbImage::new(2, 2).write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+        for i in 0..20_000 {
+            std::fs::write(photos.join(format!("{i}.png")), &buf).unwrap();
+        }
+        let db = dir.join("catalogue.db");
+        let open = || Catalogue::with(Connection::open(&db)?);
+        let f = photos.to_string_lossy().to_string();
+        open().unwrap().add_folder(&f).unwrap();
+        let (tx, rx) = channel();
+        let (f2, db2) = (f.clone(), db.clone());
+        let t = std::thread::spawn(move || {
+            scan_with(|| Catalogue::with(Connection::open(&db2)?), vec![f2], tx, egui::Context::default(), Default::default())
+        });
+        // Attendre que le scan ait vraiment commencé, puis retirer le dossier comme le ferait le menu.
+        while !matches!(rx.recv().unwrap(), ScanMsg::Progress(n) if n >= 1000) {}
+        let t0 = std::time::Instant::now();
+        open().unwrap().remove_folder(&f).unwrap();
+        assert!(t0.elapsed().as_secs_f32() < 2.0, "retrait bloqué {:?}", t0.elapsed());
+        t.join().unwrap();
+        let n: i64 = open().unwrap().conn.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn virtual_copy_paths() {

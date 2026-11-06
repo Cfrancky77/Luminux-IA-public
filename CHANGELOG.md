@@ -3,6 +3,25 @@
 Toutes les versions de Luminux IA, de la plus récente à la plus ancienne. Chaque release GitHub
 reprend la section de sa version.
 
+## [0.38.0] - 2026-11-06
+
+- Version Windows portable : `Luminux_IA-windows-x64.zip` dans chaque release (« Luminux IA.exe » avec
+  ONNX Runtime WebGPU pour l'IA, rien à installer). Explorateur pour « Afficher dans le dossier », Corbeille
+  de Windows, polices de Windows pour la signature, moteur local Windows, icône du programme. « Imprimer »
+  ouvre la page en PDF dans le lecteur PDF.
+- AppImage signée pour le lanceur FCDI Apps : chaque release publie `Luminux_IA-x86_64.AppImage.sig`
+  (Ed25519, même format que les autres applications FCDI), aussi sur le dépôt public. La signature est
+  vérifiée en CI avec la clé publique `keys/signing.pub` avant la publication.
+
+## [0.37.2] - 2026-11-03
+
+- Bibliothèque : un dossier peut être retiré (clic droit, « Retirer de la bibliothèque ») même pendant un long
+  scan. Avant, le retrait échouait sans message tant que le scan tournait, et un dossier trop large (/home)
+  rendait la bibliothèque bloquée.
+- Bouton « Arrêter » à côté du compteur de scan, en bas : les photos déjà trouvées restent, « Actualiser »
+  reprend le parcours.
+- Les dossiers cachés (`.cache`, `.local`, vignettes d'applications…) ne sont plus parcourus.
+
 ## [0.37.1] - 2026-11-01
 
 - Icône : la forêt n'est plus que du côté « après » ; côté « avant », un fond gris avec les sapins à peine

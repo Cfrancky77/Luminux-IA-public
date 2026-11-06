@@ -6,6 +6,9 @@
 //!         luminux --batch <dossier> <jpg|webp|avif|png|tif> <photos…>   (export par lots)
 //!         luminux --import <packs…>   (LUT .cube, presets .xmp/.lrtemplate/.lnpc, .zip)
 
+// Windows : pas de console derrière la fenêtre (le mode ligne de commande garde la sortie si lancé d'un terminal).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[macro_use]
 mod i18n;
 mod adjust;
@@ -26,6 +29,7 @@ mod layers;
 mod lens;
 mod library;
 mod looks;
+mod platform;
 mod print;
 mod masks;
 mod reshape;

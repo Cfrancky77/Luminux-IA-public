@@ -288,8 +288,14 @@ pub fn lp_args(o: &Options, file: &Path, title: &str) -> Vec<String> {
     a
 }
 
-/// Imprimantes CUPS installées et celle par défaut.
+/// Windows : pas de CUPS ; « Imprimer » ouvre le PDF de la page dans le lecteur PDF, qui imprime.
+pub const VIA_PDF_READER: bool = cfg!(windows);
+
+/// Imprimantes CUPS installées et celle par défaut (aucune sous Windows).
 pub fn printers() -> (Vec<String>, Option<String>) {
+    if VIA_PDF_READER {
+        return (Vec::new(), None);
+    }
     let run = |args: &[&str]| Command::new("lpstat").args(args).env("LC_ALL", "C").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
     let mut list: Vec<String> = run(&["-e"]).map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()).unwrap_or_default();
     if list.is_empty() {
@@ -303,6 +309,11 @@ pub fn printers() -> (Vec<String>, Option<String>) {
 pub fn print(w: u32, h: u32, rgb: &[f32], o: &Options, title: &str) -> Result<String> {
     let file = std::env::temp_dir().join(format!("luminux-impression-{}.pdf", std::process::id()));
     write_pdf(&file, w, h, rgb, o)?;
+    if VIA_PDF_READER {
+        // Le lecteur garde le fichier ouvert : il reste dans le dossier temporaire.
+        crate::platform::open_file(&file);
+        return Ok(String::new());
+    }
     let out = Command::new("lp").args(lp_args(o, &file, title)).output();
     let out = match out {
         Ok(o) => o,
