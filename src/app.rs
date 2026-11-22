@@ -542,6 +542,9 @@ pub struct App {
     new_doc: Option<NewDoc>,
     /// Fenêtre des préférences ouverte.
     prefs_open: bool,
+    /// Purge du cache : analyse en attente de confirmation et dernier résultat.
+    cache_plan: Option<crate::cache::Plan>,
+    cache_msg: String,
     preloaded: Arc<std::sync::Mutex<Option<Preloaded>>>,
     preloading: Arc<std::sync::atomic::AtomicBool>,
     /// Sens de la navigation (+1 photo suivante, -1 précédente) : ce qu'on précharge.
@@ -751,6 +754,8 @@ impl App {
             comfy_models: Vec::new(),
             new_doc: None,
             prefs_open: false,
+            cache_plan: None,
+            cache_msg: String::new(),
             preloaded: Default::default(),
             preloading: Default::default(),
             nav_dir: 1,
@@ -1398,10 +1403,62 @@ impl App {
                 self.settings.save();
                 start_bg = true;
             }
+            ui.separator();
+            self.cache_ui(ui);
         });
         self.prefs_open = open;
         if start_bg {
             self.start_bg_masks(ctx);
+        }
+    }
+
+    /// Préférences : taille du cache (masques IA, gommes, débruitages) et purge.
+    fn cache_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::library::format_bytes as fb;
+        ui.label(egui::RichText::new(t!("Cache")).strong());
+        ui.small(t!("Masques IA, résultats des gommes, débruitages et images de diagnostic gardés pour aller plus vite. Tout se recalcule ; tes photos et tes réglages ne sont pas touchés."));
+        let mut action = None;
+        match &self.cache_plan {
+            None => {
+                if ui.button(t!("Purger le cache…")).clicked() {
+                    action = Some(0);
+                }
+            }
+            Some(plan) => {
+                ui.label(tf!("Masques IA : {0} · Gommes : {1} · Débruitages : {2} · Diagnostic : {3}", fb(plan.total[0]), fb(plan.total[1]), fb(plan.total[2]), fb(plan.total[3])));
+                ui.label(tf!("Orphelins (photo déplacée, supprimée ou modifiée, retouche retirée, diagnostic) : {0} fichiers, {1}", plan.orphans.len(), fb(plan.orphan_bytes())));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!plan.orphans.is_empty(), egui::Button::new(tf!("Supprimer les orphelins ({0})", fb(plan.orphan_bytes())))).clicked() {
+                        action = Some(1);
+                    }
+                    if ui.add_enabled(!plan.all.is_empty(), egui::Button::new(tf!("Tout vider ({0})", fb(plan.all_bytes())))).on_hover_text(t!("Les masques se recalculent à l'usage ; les générations ComfyUI et les gommes IA sont plus longues à refaire.")).clicked() {
+                        action = Some(2);
+                    }
+                    if ui.button(t!("Annuler")).clicked() {
+                        action = Some(3);
+                    }
+                });
+            }
+        }
+        match action {
+            Some(0) => {
+                let mut photos: Vec<PathBuf> = self.catalogue.as_ref().map(|c| c.list(None, library::Filter::All, library::Sort::Name, None).into_iter().map(|p| p.path).collect()).unwrap_or_default();
+                photos.extend(self.path.clone());
+                photos.extend(self.settings.last_photo.clone());
+                self.cache_plan = Some(crate::cache::plan(&photos, &self.settings.denoise_model));
+                self.cache_msg.clear();
+            }
+            Some(a @ (1 | 2)) => {
+                if let Some(plan) = self.cache_plan.take() {
+                    let (n, bytes) = crate::cache::delete(if a == 1 { &plan.orphans } else { &plan.all });
+                    self.cache_msg = tf!("{0} fichiers supprimés, {1} libérés.", n, fb(bytes));
+                }
+            }
+            Some(_) => self.cache_plan = None,
+            None => {}
+        }
+        if !self.cache_msg.is_empty() {
+            ui.label(&self.cache_msg);
         }
     }
 

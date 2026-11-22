@@ -15,6 +15,7 @@ mod adjust;
 mod ai;
 mod app;
 mod batch;
+mod cache;
 mod comfy;
 mod composition;
 mod cull;

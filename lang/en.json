@@ -914,5 +914,14 @@
  "Échec de l'impression : {e:#}": "Printing failed: {e:#}",
  "Éclaircit : le noir disparaît.": "Lightens: black disappears.",
  "ppp": "ppi",
- "Aperçu sur la photo tant que la fenêtre est ouverte (sans le mode de fusion).": "Previewed on the photo while this window is open (without the blend mode)."
+ "Aperçu sur la photo tant que la fenêtre est ouverte (sans le mode de fusion).": "Previewed on the photo while this window is open (without the blend mode).",
+ "Cache": "Cache",
+ "Masques IA, résultats des gommes, débruitages et images de diagnostic gardés pour aller plus vite. Tout se recalcule ; tes photos et tes réglages ne sont pas touchés.": "AI masks, eraser results, denoise results and diagnostic images kept for speed. Everything is recomputed when needed; your photos and settings are not touched.",
+ "Purger le cache…": "Purge cache…",
+ "Masques IA : {0} · Gommes : {1} · Débruitages : {2} · Diagnostic : {3}": "AI masks: {0} · Erasers: {1} · Denoise: {2} · Diagnostic: {3}",
+ "Orphelins (photo déplacée, supprimée ou modifiée, retouche retirée, diagnostic) : {0} fichiers, {1}": "Orphans (photo moved, deleted or modified, retouch removed, diagnostic): {0} files, {1}",
+ "Supprimer les orphelins ({0})": "Delete orphans ({0})",
+ "Tout vider ({0})": "Empty all ({0})",
+ "Les masques se recalculent à l'usage ; les générations ComfyUI et les gommes IA sont plus longues à refaire.": "Masks are recomputed on use; ComfyUI generations and AI erasers take longer to redo.",
+ "{0} fichiers supprimés, {1} libérés.": "{0} files deleted, {1} freed."
 }

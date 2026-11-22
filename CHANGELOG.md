@@ -3,6 +3,14 @@
 Toutes les versions de Luminux IA, de la plus récente à la plus ancienne. Chaque release GitHub
 reprend la section de sa version.
 
+## [0.39.0] - 2026-11-22
+
+- Préférences, section « Cache » : bouton « Purger le cache… » qui montre la taille des masques IA, des
+  résultats de gommes, des débruitages et des images de diagnostic de la gomme IA (`masks/`, `retouches/`,
+  `denoise/`, `generation/`). Il compte les fichiers orphelins
+  (photo déplacée, supprimée ou modifiée, retouche retirée ; les images de diagnostic comptent toutes) et, après confirmation, les supprime ou vide tout
+  le cache, puis affiche l'espace libéré. Les photos, les fichiers `.luminux` et le catalogue ne sont pas touchés.
+
 ## [0.38.0] - 2026-11-06
 
 - Version Windows portable : `Luminux_IA-windows-x64.zip` dans chaque release (« Luminux IA.exe » avec

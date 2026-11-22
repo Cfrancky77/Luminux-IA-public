@@ -917,7 +917,7 @@ pub fn render_guide(dev: &Developer, device: &wgpu::Device, queue: &wgpu::Queue)
 
 // ---------- Cache ----------
 
-fn cache_file(photo: &Path, m: Model) -> Option<PathBuf> {
+pub(crate) fn cache_file(photo: &Path, m: Model) -> Option<PathBuf> {
     // Les copies virtuelles partagent les masques de leur photo.
     let photo = &crate::library::source(photo);
     use std::hash::{Hash, Hasher};
